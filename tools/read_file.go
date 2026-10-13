@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
+	"strconv"
 	"strings"
 
 	"go-agent/llm"
@@ -15,27 +15,42 @@ import (
 // ============================================================================
 
 // ReadFileTool 读取指定文件的内容，以带行号的格式返回。
-// 超过 2000 行自动截断并添加提示。
+// 大文件按 start_line 分段读取，并记录该文件已被读过。
 type ReadFileTool struct {
 	workingDir string
+	state      *FileState
 }
 
 // NewReadFileTool 创建 read_file 工具。
-func NewReadFileTool(workingDir string) *ReadFileTool {
-	return &ReadFileTool{workingDir: workingDir}
+func NewReadFileTool(workingDir string, state *FileState) *ReadFileTool {
+	return &ReadFileTool{workingDir: workingDir, state: state}
 }
+
+// Name 返回工具名。
+func (t *ReadFileTool) Name() string { return "read_file" }
+
+// Mutating 报告该工具不会改变文件系统。
+func (t *ReadFileTool) Mutating() bool { return false }
 
 // Definition 返回 read_file 工具的 JSON Schema。
 func (t *ReadFileTool) Definition() llm.ToolDef {
 	return llm.ToolDef{
 		Name:        "read_file",
-		Description: "读取指定文件的内容，以行号格式返回。支持读取任意文本文件。",
+		Description: "读取指定文件的内容，以行号格式返回。默认最多 2000 行；大文件请配合 start_line 分段读取，不要一次读完整文件。",
 		InputSchema: llm.InputSchema{
 			Type: "object",
 			Properties: map[string]llm.Property{
 				"file_path": {
 					Type:        "string",
 					Description: "要读取的文件路径，相对于工作目录的相对路径",
+				},
+				"start_line": {
+					Type:        "string",
+					Description: "起始行号（1-based），默认从第 1 行开始",
+				},
+				"max_lines": {
+					Type:        "string",
+					Description: "最多返回多少行，默认 2000",
 				},
 			},
 			Required: []string{"file_path"},
@@ -51,7 +66,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	}
 
 	// 安全检查：路径必须在工作目录内
-	absPath, err := t.safePath(filePath)
+	absPath, err := resolveSafe(t.workingDir, filePath, false)
 	if err != nil {
 		return "", err
 	}
@@ -65,49 +80,64 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 		return "", fmt.Errorf("读取文件失败: %w", err)
 	}
 
-	// 按行分割并添加行号
-	lines := strings.Split(string(data), "\n")
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("📄 %s (%d 行)\n\n", filePath, len(lines)))
+	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	t.state.Mark(absPath)
 
-	const maxLines = 2000
-	truncated := len(lines) > maxLines
-	displayLines := lines
-	if truncated {
-		displayLines = lines[:maxLines]
+	// 起始行（1-based）
+	start := 0
+	if v, ok := inputNumber(input, "start_line"); ok {
+		if v < 1 {
+			return "", fmt.Errorf("参数 start_line 必须是正整数，收到: %v", v)
+		}
+		start = v - 1
+	}
+	if start >= len(lines) {
+		return "", fmt.Errorf("起始行 %d 超出文件长度（共 %d 行）", start+1, len(lines))
 	}
 
-	for i, line := range displayLines {
+	// 行数上限
+	maxLines := defaultMaxLines
+	if v, ok := inputNumber(input, "max_lines"); ok && v > 0 {
+		maxLines = min(v, defaultMaxLines)
+	}
+
+	end := min(start+maxLines, len(lines))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📄 %s (第 %d-%d 行，共 %d 行)\n\n",
+		filePath, start+1, end, len(lines)))
+
+	const maxLineBytes = 400 // 压缩过的单行文件不会把整个上下文吃掉的保险丝
+	for i := start; i < end; i++ {
+		line := lines[i]
+		if len(line) > maxLineBytes {
+			line = line[:maxLineBytes] + fmt.Sprintf(" …（本行共 %d 字节，已截断）", len(lines[i]))
+		}
 		sb.WriteString(fmt.Sprintf("%6d | %s\n", i+1, line))
 	}
 
-	if truncated {
-		sb.WriteString(fmt.Sprintf("\n... (输出被截断，共 %d 行，仅显示前 %d 行)\n", len(lines), maxLines))
+	if end < len(lines) {
+		sb.WriteString(fmt.Sprintf("\n… 还有 %d 行未显示，可用 start_line=%d 继续读\n",
+			len(lines)-end, end+1))
 	}
 
 	return sb.String(), nil
 }
 
-// safePath 将相对路径解析为绝对路径，并验证其位于工作目录内。
-func (t *ReadFileTool) safePath(relPath string) (string, error) {
-	// 拒绝绝对路径
-	if filepath.IsAbs(relPath) {
-		return "", fmt.Errorf("不允许使用绝对路径: %s", relPath)
+// defaultMaxLines 单次读取的默认行数上限。
+const defaultMaxLines = 2000
+
+// inputNumber 从工具参数里取一个整数，兼容 JSON 数字和字符串两种写法。
+func inputNumber(input map[string]any, key string) (int, bool) {
+	switch v := input[key].(type) {
+	case float64:
+		return int(v), true
+	case string:
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	default:
+		return 0, false
 	}
-
-	// 规范化路径
-	absWorkingDir, err := filepath.Abs(t.workingDir)
-	if err != nil {
-		return "", fmt.Errorf("无法获取工作目录的绝对路径: %w", err)
-	}
-
-	absPath := filepath.Join(absWorkingDir, relPath)
-	absPath = filepath.Clean(absPath)
-
-	// 验证在工作目录内
-	if !strings.HasPrefix(absPath, absWorkingDir+string(filepath.Separator)) && absPath != absWorkingDir {
-		return "", fmt.Errorf("路径越界: %s 不在工作目录内", relPath)
-	}
-
-	return absPath, nil
 }

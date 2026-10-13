@@ -1,6 +1,10 @@
 package llm
 
-import "context"
+import (
+	"context"
+
+	"go-agent/log"
+)
 
 // ============================================================================
 // Provider 接口
@@ -22,6 +26,18 @@ type Provider interface {
 	//
 	// 返回完整的 ChatResponse（包含 content blocks、finish_reason、usage）。
 	StreamingChat(ctx context.Context, req ChatRequest, onText func(text string)) (*ChatResponse, error)
+
+	// SetHTTPLogger 把请求/响应写入日志文件（可选能力，传 nil 表示关闭）。
+	SetHTTPLogger(l *log.HTTPLogger)
+}
+
+// ============================================================================
+// Provider 可选能力
+// ============================================================================
+
+// RetrySetter 由支持配置重试策略的 Provider 实现。
+type RetrySetter interface {
+	SetRetry(r Retry)
 }
 
 // ============================================================================

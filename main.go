@@ -1,39 +1,35 @@
-// 代码智能体 (Code Agent) — 基于 LLM 的交互式代码助手
+// 代码智能体 (Code Agent) — 基于 LLM 的交互式代码助手。
 //
-// 支持多个 LLM 后端 (Provider):
-//   - DeepSeek (默认): 设置 DEEPSEEK_API_KEY
-//   - Anthropic: 设置 ANTHROPIC_API_KEY + LLM_PROVIDER=anthropic
+// 两种用法：
 //
-// 使用方法:
-//
-//	export DEEPSEEK_API_KEY="sk-..."
-//	go run .
+//	交互：            go-agent                     进入 REPL，写操作逐个确认
+//	非交互：          go-agent -p "任务" --yes      跑完输出结果，适合脚本与 CI
 //
 // 环境变量:
 //
-//	LLM_PROVIDER      后端 Provider: "deepseek"(默认) 或 "anthropic"
-//	DEEPSEEK_API_KEY  DeepSeek API 密钥
-//	ANTHROPIC_API_KEY Anthropic API 密钥
-//	LLM_MODEL         模型 ID (默认: deepseek-v4-flash / claude-opus-4-8)
-//	LOG_LEVEL         日志级别: "debug" / "info"(默认) / "warn" / "error"
-//	LLM_LOG_DIR        HTTP 日志目录 (默认: ./logs)
-//
-// 特殊命令:
-//
-//	/help   — 显示帮助
-//	/clear  — 清空对话历史
-//	/exit   — 退出程序
-//	/model  — 显示当前模型
+//	LLM_PROVIDER       deepseek(默认) / anthropic / openai 兼容端点
+//	DEEPSEEK_API_KEY   DeepSeek 密钥
+//	ANTHROPIC_API_KEY  Anthropic 密钥
+//	LLM_MODEL          模型 ID，也可用 -model 覆盖
+//	LLM_BASE_URL       OpenAI 兼容端点地址（配合 LLM_PROVIDER=openai）
+//	LOG_LEVEL          debug / info(默认) / warn / error
+//	LLM_LOG_DIR        HTTP 日志目录，默认 ./logs
 package main
 
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 
 	"go-agent/agent"
 	"go-agent/llm"
@@ -41,177 +37,499 @@ import (
 	"go-agent/tools"
 )
 
+// ============================================================================
+// 运行期上下文
+// ============================================================================
+
+type app struct {
+	cfg      agent.Config
+	provider llm.Provider
+	registry *tools.Registry
+	gate     *tools.Gate
+	agent    *agent.Agent
+	plan     *tools.PlanTool
+
+	out  io.Writer
+	in   *bufio.Reader
+	json bool // 只把结果以 JSON 打到 stdout
+
+	mu        sync.Mutex
+	running   bool
+	cancelRun context.CancelFunc
+	interrupt int
+	sessionID string
+	turns     int
+}
+
 func main() {
-	// ─────────────────────────────────────────────
-	// 1. 日志级别
-	// ─────────────────────────────────────────────
-	logLevel := os.Getenv("LOG_LEVEL")
-	if logLevel != "" {
-		log.SetLevel(log.ParseLevel(logLevel))
-	}
-
-	log.Info("[main.go:48] ========== Go Code Agent 启动 ==========")
-	log.Debug("[main.go:49] LOG_LEVEL=%v", log.GetLevel())
-
-	// ─────────────────────────────────────────────
-	// 1.5. HTTP 请求/响应日志（写入文件）
-	// ─────────────────────────────────────────────
-	httpLogDir := os.Getenv("LLM_LOG_DIR")
-	if httpLogDir == "" {
-		httpLogDir = "logs"
-	}
-	httpLogger, err := log.NewHTTPLogger(httpLogDir)
+	a, prompt, err := newApp(os.Args[1:])
 	if err != nil {
-		fmt.Printf("⚠️  无法创建 HTTP 日志文件: %v (继续运行)\n\n", err)
-	} else {
-		defer httpLogger.Close()
+		var e errExit
+		switch {
+		case errors.As(err, &e):
+			os.Exit(e.code)
+		case errors.Is(err, flag.ErrHelp):
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "❌ %v\n", err)
+		os.Exit(2)
 	}
 
-	// ─────────────────────────────────────────────
-	// 2. 选择 Provider 和 API Key
-	// ─────────────────────────────────────────────
-	provider := selectProvider(httpLogger)
-	log.Info("[main.go:55] Provider: %s", provider.Name())
+	if prompt != "" {
+		os.Exit(a.runOnce(prompt))
+	}
+	os.Exit(a.repl())
+}
 
-	// ─────────────────────────────────────────────
-	// 3. 获取工作目录
-	// ─────────────────────────────────────────────
+// ============================================================================
+// 启动装配
+// ============================================================================
+
+func newApp(args []string) (*app, string, error) {
+	fs := flag.NewFlagSet("go-agent", flag.ContinueOnError)
+	fs.Usage = usage(fs)
+
+	var (
+		prompt    = fs.String("p", "", "非交互模式：执行一条任务后退出")
+		model     = fs.String("model", "", "模型 ID，覆盖 LLM_MODEL")
+		provider  = fs.String("provider", "", "deepseek / anthropic / openai")
+		yes       = fs.Bool("yes", false, "预先放行所有写操作与命令（禁止清单仍然生效）")
+		asJSON    = fs.Bool("json", false, "只输出 JSON 结果（隐含 -quiet）")
+		quiet     = fs.Bool("quiet", false, "不打印执行过程")
+		maxTurns  = fs.Int("max-turns", 30, "单次任务允许的最大轮数")
+		cmdTO     = fs.Duration("cmd-timeout", 2*time.Minute, "单条命令默认超时")
+		resume    = fs.String("resume", "", "恢复会话：会话 ID 或 last")
+		noSession = fs.Bool("no-session", false, "不把对话写入 .go-agent/sessions")
+		logLevel  = fs.String("log-level", os.Getenv("LOG_LEVEL"), "日志级别 debug/info/warn/error")
+		printVers = fs.Bool("version", false, "打印版本后退出")
+	)
+
+	if err := fs.Parse(args); err != nil {
+		return nil, "", err
+	}
+	if *printVers {
+		fmt.Println("go-agent v0.2")
+		return nil, "", errExit{0}
+	}
+
+	if *logLevel != "" {
+		log.SetLevel(log.ParseLevel(*logLevel))
+	}
+
+	promptText := strings.TrimSpace(*prompt)
+	if promptText == "" {
+		promptText = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
+	nonInteractive := promptText != ""
+
 	workingDir, err := os.Getwd()
 	if err != nil {
-		log.Error("[main.go:61] 无法获取当前目录: %v", err)
-		fmt.Printf("❌ 无法获取当前目录: %v\n", err)
-		os.Exit(1)
-	}
-	log.Debug("[main.go:65] 工作目录: %s", workingDir)
-
-	// ─────────────────────────────────────────────
-	// 4. 初始化组件
-	// ─────────────────────────────────────────────
-	log.Debug("[main.go:70] 初始化工具注册表...")
-
-	// 工具注册表
-	registry := tools.NewRegistry()
-	registry.Register(tools.NewReadFileTool(workingDir))
-	registry.Register(tools.NewWriteFileTool(workingDir))
-	registry.Register(tools.NewListDirectoryTool(workingDir))
-	registry.Register(tools.NewSearchCodeTool(workingDir))
-	registry.Register(tools.NewRunCommandTool(workingDir))
-	log.Debug("[main.go:78] 已注册 5 个工具: read_file, write_file, list_directory, search_code, run_command")
-
-	// 模型选择
-	model := os.Getenv("LLM_MODEL")
-	if model == "" {
-		model = defaultModel(provider)
+		return nil, "", fmt.Errorf("无法获取当前目录: %w", err)
 	}
 
-	// 智能体
-	config := agent.DefaultConfig(workingDir, model)
-	agt := agent.New(config, provider, registry)
-	log.Debug("[main.go:89] Agent 已创建: model=%s, maxTokens=%d, maxIterations=%d",
-		config.Model, config.MaxTokens, config.MaxIterations)
+	httpLogDir := envOr("LLM_LOG_DIR", "logs")
+	httpLogger, err := log.NewHTTPLogger(httpLogDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "⚠️  HTTP 日志不可用: %v（继续运行）\n", err)
+		httpLogger = nil
+	}
 
-	// ─────────────────────────────────────────────
-	// 5. 信号处理（Ctrl+C 优雅退出）
-	// ─────────────────────────────────────────────
+	prov, provName, err := selectProvider(*provider, httpLogger)
+	if err != nil {
+		return nil, "", err
+	}
+
+	modelID := firstNonEmpty(*model, os.Getenv("LLM_MODEL"), "")
+	if modelID == "" {
+		modelID = defaultModel(provName)
+	}
+
+	a := &app{
+		out:       os.Stdout,
+		in:        bufio.NewReader(os.Stdin),
+		json:      *asJSON,
+		sessionID: agent.NewSessionID(),
+	}
+	if *noSession {
+		a.sessionID = ""
+	}
+
+	gateMode := tools.ModeAsk
+	switch {
+	case *yes:
+		gateMode = tools.ModeAuto
+	case nonInteractive:
+		gateMode = tools.ModeReadOnly
+	}
+	a.gate = tools.NewGate(gateMode)
+	a.gate.Out = a.ui()
+
+	// 注册工具
+	a.registry = tools.NewRegistry()
+	state := tools.NewFileState()
+	a.plan = tools.NewPlanTool(a.ui())
+	a.registry.Register(tools.NewReadFileTool(workingDir, state))
+	a.registry.Register(tools.NewSearchCodeTool(workingDir))
+	a.registry.Register(tools.NewListDirectoryTool(workingDir))
+	a.registry.Register(tools.NewWriteFileTool(workingDir, a.gate, state))
+	a.registry.Register(tools.NewEditFileTool(workingDir, a.gate, state))
+	a.registry.Register(tools.NewMoveFileTool(workingDir, a.gate, state))
+	a.registry.Register(tools.NewDeleteFileTool(workingDir, a.gate, state))
+	a.registry.Register(tools.NewRunCommandTool(workingDir, a.gate, *cmdTO, a.ui()))
+	a.registry.Register(a.plan)
+
+	cfg := agent.DefaultConfig(workingDir, modelID)
+	cfg.MaxIterations = *maxTurns
+	cfg.Quiet = *asJSON || *quiet
+	cfg.Writer = os.Stdout
+	a.cfg = cfg
+	a.provider = prov
+	a.agent = agent.New(cfg, prov, a.registry)
+
+	// 交互模式下由人逐个确认；非交互模式没有可问的人。
+	if gateMode == tools.ModeAsk {
+		a.gate.Ask = a.confirm
+	}
+
+	if *resume != "" {
+		if err := a.resumeSession(*resume); err != nil {
+			return nil, "", err
+		}
+	}
+
+	a.installSignalHandler()
+	return a, promptText, nil
+}
+
+// ui 返回过程输出的目标：JSON 模式下丢弃，避免污染 stdout。
+func (a *app) ui() io.Writer {
+	if a.json {
+		return io.Discard
+	}
+	return a.out
+}
+
+// ============================================================================
+// 执行一条任务
+// ============================================================================
+
+func (a *app) runOnce(prompt string) int {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	a.setRunning(cancel)
+	defer a.setRunning(nil)
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		sig := <-sigCh
-		log.Info("[main.go:102] 收到退出信号: %v", sig)
-		fmt.Println("\n\n👋 收到退出信号，正在退出...")
-		cancel()
-	}()
+	res, err := a.agent.Run(ctx, prompt)
+	a.persistSession(res)
 
-	// ─────────────────────────────────────────────
-	// 6. 欢迎信息
-	// ─────────────────────────────────────────────
-	printWelcome(config, provider)
+	if a.json {
+		payload := map[string]any{
+			"reply":       "",
+			"stop_reason": "error",
+			"error":       "",
+		}
+		if res != nil {
+			payload["reply"] = res.Reply
+			payload["stop_reason"] = res.StopReason
+			payload["iterations"] = res.Iterations
+			payload["usage"] = res.Usage
+			payload["cost_usd"] = res.CostUSD
+		}
+		if err != nil {
+			payload["error"] = err.Error()
+		}
+		data, _ := json.MarshalIndent(payload, "", "  ")
+		fmt.Println(string(data))
+		if err != nil {
+			return 1
+		}
+		return 0
+	}
 
-	// ─────────────────────────────────────────────
-	// 7. REPL 循环
-	// ─────────────────────────────────────────────
-	fmt.Println("输入你的任务（输入 /help 查看帮助，/exit 退出）")
+	if err != nil {
+		fmt.Fprintf(a.out, "\n❌ %v\n", err)
+		if res != nil && res.Reply != "" {
+			fmt.Fprintf(a.out, "已完成的回复内容：\n%s\n", res.Reply)
+		}
+		return 1
+	}
+
+	fmt.Fprintf(a.out, "\n%s\n", report(res))
+	return 0
+}
+
+// report 把一次任务的结果写成人能读的一段话。
+func report(res *agent.Result) string {
+	var sb strings.Builder
+	sb.WriteString(strings.Repeat("─", 56) + "\n")
+	sb.WriteString(fmt.Sprintf("✅ 完成 · %d 轮 · 耗时 %s\n",
+		res.Iterations, res.Elapsed.Round(time.Millisecond)))
+	sb.WriteString(fmt.Sprintf("   token 输入 %d / 输出 %d，约 $%.4f\n",
+		res.Usage.InputTokens, res.Usage.OutputTokens, res.CostUSD))
+	if res.Compactions > 0 {
+		sb.WriteString(fmt.Sprintf("   期间折叠过 %d 次历史以腾出上下文\n", res.Compactions))
+	}
+	return sb.String()
+}
+
+// repl 交互式循环。
+func (a *app) repl() int {
+	a.printWelcome()
 
 	for {
-		// 读取用户输入
-		input := readInput()
+		input, eof := a.readInput()
+		if eof {
+			fmt.Println()
+			return 0
+		}
 		if input == "" {
 			continue
 		}
 
-		// 处理特殊命令
-		switch {
-		case input == "/exit" || input == "/quit":
-			fmt.Println("👋 再见!")
-			log.Info("[main.go:122] 用户退出")
-			return
-
-		case input == "/help":
-			printHelp()
-			continue
-
-		case input == "/clear":
-			agt.ClearHistory()
-			fmt.Println("✅ 对话历史已清空")
-			continue
-
-		case input == "/model":
-			fmt.Printf("📋 当前模型: %s\n", config.Model)
-			fmt.Printf("🔌 Provider: %s\n\n", provider.Name())
-			continue
-
-		case strings.HasPrefix(input, "/model "):
-			newModel := strings.TrimPrefix(input, "/model ")
-			config.Model = newModel
-			log.Info("[main.go:140] 切换模型: %s -> %s", model, newModel)
-			model = newModel
-			fmt.Printf("✅ 已切换模型为: %s\n\n", newModel)
-			continue
-
-		case input == "/log":
-			lvl := log.GetLevel()
-			fmt.Printf("📋 当前日志级别: %v\n\n", lvl)
-			continue
-
-		case strings.HasPrefix(input, "/log "):
-			newLevel := strings.TrimPrefix(input, "/log ")
-			lvl := log.ParseLevel(newLevel)
-			log.SetLevel(lvl)
-			log.Info("[main.go:153] 切换日志级别: %v", lvl)
-			fmt.Printf("✅ 已切换日志级别为: %v\n\n", lvl)
+		if handled, quit := a.handleCommand(input); handled {
+			if quit {
+				return 0
+			}
 			continue
 		}
 
-		// 执行任务
-		log.Info("[main.go:159] ── 开始执行用户任务 ──")
-		reply, usage, err := agt.Run(ctx, input)
+		a.runTask(input)
+	}
+}
 
+func (a *app) runTask(input string) {
+	ctx, cancel := context.WithCancel(context.Background())
+	a.setRunning(cancel)
+
+	res, err := a.agent.Run(ctx, input)
+	a.setRunning(nil)
+	a.turns++
+	a.persistSession(res)
+
+	switch {
+	case errors.Is(err, agent.ErrInterrupted):
+		fmt.Fprintf(a.out, "\n⚠️  已中断。对话还在，输入「继续」可以从这里接着做。\n")
+		return
+	case err != nil:
+		fmt.Fprintf(a.out, "\n❌ %v\n", err)
+		fmt.Fprintf(a.out, "对话已保留；需要重来可以输入 /clear 清空。\n")
+		return
+	}
+
+	fmt.Fprintf(a.out, "\n%s\n", report(res))
+}
+
+// ============================================================================
+// 会话持久化
+// ============================================================================
+
+func (a *app) persistSession(res *agent.Result) {
+	if a.sessionID == "" {
+		return
+	}
+	usage := a.agent.Usage()
+	if res != nil {
+		usage = res.Usage
+	}
+	s := agent.Session{
+		ID:         a.sessionID,
+		WorkingDir: a.cfg.WorkingDir,
+		Provider:   a.provider.Name(),
+		Model:      a.cfg.Model,
+		Messages:   a.agent.History(),
+		Usage:      usage,
+		Turns:      a.turns,
+	}
+	if err := agent.Save(a.cfg.WorkingDir, s); err != nil {
+		log.Warn("会话保存失败: %v", err)
+	}
+}
+
+func (a *app) resumeSession(id string) error {
+	s, err := agent.Load(a.cfg.WorkingDir, id)
+	if err != nil {
+		return err
+	}
+	a.agent.LoadHistory(s.Messages)
+	a.sessionID = s.ID
+	fmt.Fprintf(a.out, "✅ 已恢复会话 %s（%d 条消息，模型 %s）\n", s.ID, len(s.Messages), s.Model)
+	return nil
+}
+
+// ============================================================================
+// 中断处理
+// ============================================================================
+
+// installSignalHandler 让 Ctrl+C 在执行中只取消当前任务，空闲时才退出。
+// 旧行为是执行中按 Ctrl+C 直接退进程，把整段对话一起丢掉。
+func (a *app) installSignalHandler() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		for sig := range ch {
+			a.mu.Lock()
+			running, cancel, count := a.running, a.cancelRun, a.interrupt
+			if running {
+				a.interrupt++
+			}
+			a.mu.Unlock()
+
+			if running && cancel != nil && count == 0 {
+				fmt.Fprintf(a.out, "\n\n⏸  正在取消当前任务…（再按一次立即退出）\n")
+				cancel()
+				continue
+			}
+			fmt.Fprintf(a.out, "\n\n👋 收到 %v，退出。\n", sig)
+			os.Exit(130)
+		}
+	}()
+}
+
+func (a *app) setRunning(cancel context.CancelFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.running = cancel != nil
+	a.cancelRun = cancel
+	a.interrupt = 0
+}
+
+// ============================================================================
+// 输入与确认
+// ============================================================================
+
+// confirm 向用户确认一次有副作用的操作。
+func (a *app) confirm(title, detail string) bool {
+	fmt.Fprintf(a.out, "\n  🔶 %s\n     %s\n  允许执行？[y/N] ", title, detail)
+	line, err := a.in.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes", "是":
+		// 同一轮里用户可能只想放行这一次，不改变全局模式
+		return true
+	case "a", "all":
+		a.gate.Mode = tools.ModeAuto
+		fmt.Fprintf(a.out, "  本轮剩余操作自动放行（/reset-approval 可恢复逐个确认）\n")
+		return true
+	default:
+		return false
+	}
+}
+
+// readInput 读取一条任务。行尾 \ 表示续行，空行结束。
+func (a *app) readInput() (string, bool) {
+	var lines []string
+	for {
+		fmt.Print("> ")
+		line, err := a.in.ReadString('\n')
 		if err != nil {
-			// 区分用户取消 vs 其他错误
-			if ctx.Err() != nil {
-				log.Warn("[main.go:164] 任务被用户取消")
-				fmt.Println("\n⚠️  任务被取消")
+			return "", true
+		}
+		line = strings.TrimRight(line, "\r\n")
+
+		if strings.TrimSpace(line) == "" {
+			if len(lines) == 0 {
+				continue
+			}
+			break
+		}
+		if strings.HasSuffix(line, "\\") {
+			lines = append(lines, strings.TrimSuffix(line, "\\"))
+			continue
+		}
+		lines = append(lines, line)
+		break
+	}
+	return strings.Join(lines, "\n"), false
+}
+
+// ============================================================================
+// 斜杠命令
+// ============================================================================
+
+func (a *app) handleCommand(input string) (handled, quit bool) {
+	name, arg, _ := strings.Cut(input, " ")
+	arg = strings.TrimSpace(arg)
+
+	switch name {
+	case "/exit", "/quit":
+		return true, true
+	case "/help":
+		printHelp()
+		return true, false
+	case "/clear":
+		a.agent.ClearHistory()
+		a.sessionID = agent.NewSessionID()
+		fmt.Println("✅ 对话历史已清空，新会话开始")
+		return true, false
+	case "/model":
+		if arg == "" {
+			fmt.Printf("📋 当前模型: %s（上下文 %d）\nProvider: %s\n",
+				a.cfg.Model, a.cfg.ContextWindow, a.provider.Name())
+			return true, false
+		}
+		a.cfg.Model = arg
+		a.agent.SetModel(arg)
+		fmt.Printf("✅ 已切换到 %s\n\n", arg)
+		return true, false
+	case "/log":
+		if arg == "" {
+			fmt.Printf("📋 当前日志级别: %v\n\n", log.GetLevel())
+			return true, false
+		}
+		log.SetLevel(log.ParseLevel(arg))
+		fmt.Printf("✅ 日志级别: %v\n\n", log.GetLevel())
+		return true, false
+	case "/cost":
+		u := a.agent.Usage()
+		fmt.Printf("📊 累计 token：输入 %d / 输出 %d，约 $%.4f（按内置价目表估算）\n\n",
+			u.InputTokens, u.OutputTokens, agent.EstimateCost(a.cfg.Model, u))
+		return true, false
+	case "/tools":
+		fmt.Printf("🔧 已注册工具: %s\n\n", strings.Join(a.registry.Names(), ", "))
+		return true, false
+	case "/plan":
+		steps := a.plan.Steps()
+		if len(steps) == 0 {
+			fmt.Println("（当前没有清单）")
+		}
+		for _, s := range steps {
+			fmt.Println("  " + s)
+		}
+		fmt.Println()
+		return true, false
+	case "/sessions":
+		list, err := agent.List(a.cfg.WorkingDir)
+		if err != nil {
+			fmt.Printf("❌ %v\n\n", err)
+			return true, false
+		}
+		if len(list) == 0 {
+			fmt.Println("（还没有保存的会话）")
+			fmt.Println()
+			return true, false
+		}
+		for i, s := range list {
+			if i >= 15 {
+				fmt.Printf("  …（共 %d 个）\n", len(list))
 				break
 			}
-			log.Error("[main.go:168] 任务执行失败: %v", err)
-			fmt.Printf("\n❌ 错误: %v\n\n", err)
-			continue
+			fmt.Printf("  %s  %s  %d 轮  %s\n", s.UpdatedAt.Format("01-02 15:04"), s.ID, s.Turns, s.Preview)
 		}
-
-		// 显示 token 用量
-		totalTokens := usage.InputTokens + usage.OutputTokens
-		fmt.Printf("\n📊 Token 用量: 输入 %d + 输出 %d = 总计 %d\n\n",
-			usage.InputTokens,
-			usage.OutputTokens,
-			totalTokens,
-		)
-		log.Info("[main.go:180] 任务完成: inTokens=%d outTokens=%d total=%d",
-			usage.InputTokens, usage.OutputTokens, totalTokens)
-
-		_ = reply // reply 已通过流式回调实时打印
+		fmt.Printf("\n用 /resume <ID> 恢复，/resume last 恢复最近一次\n\n")
+		return true, false
+	case "/resume":
+		if err := a.resumeSession(arg); err != nil {
+			fmt.Printf("❌ %v\n\n", err)
+		}
+		fmt.Println()
+		return true, false
+	case "/reset-approval":
+		a.gate.Mode = tools.ModeAsk
+		fmt.Println("✅ 恢复逐个确认")
+		return true, false
+	default:
+		return false, false
 	}
 }
 
@@ -219,151 +537,141 @@ func main() {
 // Provider 选择
 // ============================================================================
 
-// selectProvider 根据环境变量选择并创建 LLM Provider。
-func selectProvider(httpLogger *log.HTTPLogger) llm.Provider {
-	providerEnv := strings.ToLower(os.Getenv("LLM_PROVIDER"))
+// selectProvider 按选项和密钥选择 Provider。
+// 返回的 name 是"实际生效的厂商"，可能与 p.Name() 不同：
+// OpenAI 兼容端点复用 DeepSeekProvider（其 Name() 恒为 deepseek），
+// 而默认模型要按厂商区分，所以这里把选择分支的名字带回去。
+func selectProvider(fromFlag string, httpLogger *log.HTTPLogger) (llm.Provider, string, error) {
+	name := strings.ToLower(firstNonEmpty(fromFlag, os.Getenv("LLM_PROVIDER"), "deepseek"))
 	deepseekKey := os.Getenv("DEEPSEEK_API_KEY")
 	anthropicKey := os.Getenv("ANTHROPIC_API_KEY")
+	openaiKey := os.Getenv("OPENAI_API_KEY")
 
-	switch {
-	case providerEnv == "anthropic":
-		if anthropicKey == "" {
-			fmt.Println("❌ 设置了 LLM_PROVIDER=anthropic 但未设置 ANTHROPIC_API_KEY")
-			os.Exit(1)
-		}
-		log.Debug("[main.go:220] 使用 Anthropic Provider")
-		p := llm.NewAnthropicProvider(anthropicKey)
-		p.SetHTTPLogger(httpLogger)
-		return p
-
-	case providerEnv == "deepseek" || providerEnv == "":
-		if deepseekKey != "" {
-			log.Debug("[main.go:227] 使用 DeepSeek Provider")
-			p := llm.NewDeepSeekProvider(deepseekKey)
-			p.SetHTTPLogger(httpLogger)
-			return p
-		}
-		if anthropicKey != "" {
-			log.Debug("[main.go:233] 未设置 DEEPSEEK_API_KEY，自动使用 Anthropic")
-			p := llm.NewAnthropicProvider(anthropicKey)
-			p.SetHTTPLogger(httpLogger)
-			return p
-		}
-		fmt.Println("❌ 未设置 DEEPSEEK_API_KEY 环境变量")
-		fmt.Println()
-		fmt.Println("请设置后重试：")
-		fmt.Println("  export DEEPSEEK_API_KEY=\"sk-...\"")
-		fmt.Println()
-		fmt.Println("或使用 Anthropic:")
-		fmt.Println("  export ANTHROPIC_API_KEY=\"sk-ant-...\"")
-		fmt.Println("  export LLM_PROVIDER=anthropic")
-		os.Exit(1)
-
-	default:
-		fmt.Printf("❌ 未知的 LLM_PROVIDER: %s (支持: deepseek, anthropic)\n", providerEnv)
-		os.Exit(1)
-	}
-
-	return nil // unreachable
-}
-
-// defaultModel 返回 Provider 的默认模型。
-func defaultModel(provider llm.Provider) string {
-	switch provider.Name() {
-	case "deepseek":
-		return "deepseek-v4-flash"
+	var p llm.Provider
+	var effName string
+	switch name {
 	case "anthropic":
-		return "claude-opus-4-8"
+		if anthropicKey == "" {
+			return nil, "", fmt.Errorf("provider=anthropic 但 ANTHROPIC_API_KEY 未设置")
+		}
+		p = llm.NewAnthropicProvider(anthropicKey)
+		effName = "anthropic"
+	case "deepseek":
+		switch {
+		case deepseekKey != "":
+			p = llm.NewDeepSeekProvider(deepseekKey)
+			effName = "deepseek"
+		case anthropicKey != "":
+			fmt.Fprintln(os.Stderr, "未找到 DEEPSEEK_API_KEY，改用 Anthropic")
+			p = llm.NewAnthropicProvider(anthropicKey)
+			effName = "anthropic"
+		default:
+			return nil, "", fmt.Errorf("缺少密钥：设置 DEEPSEEK_API_KEY 或 ANTHROPIC_API_KEY（见 -h）")
+		}
+	case "openai":
+		if openaiKey == "" {
+			return nil, "", fmt.Errorf("provider=openai 但 OPENAI_API_KEY 未设置")
+		}
+		p = llm.NewDeepSeekProviderWithBaseURL(envOr("LLM_BASE_URL", "https://api.openai.com/v1"), openaiKey)
+		effName = "openai"
 	default:
-		return "deepseek-v4-flash"
+		return nil, "", fmt.Errorf("未知 provider: %s（支持 deepseek / anthropic / openai）", name)
+	}
+
+	if httpLogger != nil {
+		p.SetHTTPLogger(httpLogger)
+	}
+	log.Info("Provider: %s", effName)
+	return p, effName, nil
+}
+
+// defaultModel 返回该厂商未指定模型时使用的默认 ID。
+func defaultModel(providerName string) string {
+	switch providerName {
+	case "anthropic":
+		return "claude-sonnet-4-5"
+	case "openai":
+		return "gpt-4o-mini"
+	default:
+		return agent.DefaultModel
 	}
 }
 
 // ============================================================================
-// 辅助函数
+// 帮助与欢迎
 // ============================================================================
 
-// printWelcome 打印欢迎信息。
-func printWelcome(config agent.Config, provider llm.Provider) {
-	fmt.Println(strings.Repeat("━", 60))
-	fmt.Println("🤖 Go 代码智能体 (Code Agent) v2")
-	fmt.Println(strings.Repeat("━", 60))
-	fmt.Printf("📁 工作目录: %s\n", config.WorkingDir)
-	fmt.Printf("🔌 Provider:  %s\n", provider.Name())
-	fmt.Printf("🧠 模型:     %s\n", config.Model)
-	fmt.Printf("🔧 可用工具: read_file, write_file, list_directory, search_code, run_command\n")
-	fmt.Printf("🔄 最大轮次: %d\n", config.MaxIterations)
-	fmt.Printf("📝 日志级别: %v\n", log.GetLevel())
-	fmt.Println(strings.Repeat("━", 60))
+func (a *app) printWelcome() {
+	out := a.out
+	fmt.Fprintln(out, strings.Repeat("━", 60))
+	fmt.Fprintln(out, "🤖 Go 代码智能体 v0.2")
+	fmt.Fprintln(out, strings.Repeat("━", 60))
+	fmt.Fprintf(out, "📁 工作目录: %s\n", a.cfg.WorkingDir)
+	fmt.Fprintf(out, "🔌 Provider:  %s\n", a.provider.Name())
+	fmt.Fprintf(out, "🧠 模型:     %s（上下文 %d）\n", a.cfg.Model, a.cfg.ContextWindow)
+	fmt.Fprintf(out, "🔧 工具:     %s\n", strings.Join(a.registry.Names(), ", "))
+	fmt.Fprintf(out, "🔐 审批:     %s\n", string(a.gate.Mode))
+	fmt.Fprintf(out, "🔄 最大轮次: %d\n", a.cfg.MaxIterations)
+	if a.sessionID != "" {
+		fmt.Fprintf(out, "💾 会话:     %s（/resume last 可恢复）\n", a.sessionID)
+	}
+	fmt.Fprintln(out, strings.Repeat("━", 60))
+	fmt.Fprintln(out, "输入任务开始（/help 看命令，/exit 退出）")
 }
 
-// printHelp 打印帮助信息。
 func printHelp() {
-	fmt.Println()
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Println("  💡 命令帮助")
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Println()
-	fmt.Println("  输入任务描述即可让智能体开始工作，例如：")
-	fmt.Println("    • 「列出当前目录所有 Go 文件」")
-	fmt.Println("    • 「读取 main.go 并解释其功能」")
-	fmt.Println("    • 「搜索所有包含 TODO 的文件」")
-	fmt.Println("    • 「创建一个 hello.go 文件，输出 Hello World」")
-	fmt.Println("    • 「运行 go build 检查是否有编译错误」")
-	fmt.Println()
-	fmt.Println("  特殊命令:")
-	fmt.Println("    /help       显示本帮助")
-	fmt.Println("    /clear      清空对话历史（重置上下文）")
-	fmt.Println("    /model      查看当前模型")
-	fmt.Println("    /model <名> 切换模型（如 /model deepseek-pro、deepseek-flash）")
-	fmt.Println("    /log        查看当前日志级别")
-	fmt.Println("    /log <级别> 切换日志级别（debug / info / warn / error）")
-	fmt.Println("    /exit       退出程序")
-	fmt.Println()
-	fmt.Println("  多行输入: 行尾加 \\ 续行，空行结束输入")
-	fmt.Println("  Ctrl+C:    取消当前任务或退出程序")
-	fmt.Println()
+	fmt.Println(`
+命令：
+  /help                 本帮助
+  /clear                清空对话，开新会话
+  /sessions             列出保存过的会话
+  /resume <ID|last>     恢复某次对话
+  /model [名]           查看或切换模型
+  /cost                 累计 token 与估算花费
+  /tools                列出可用工具
+  /plan                 查看当前任务清单
+  /log [级别]           查看或切换日志级别
+  /reset-approval       恢复逐个确认
+  /exit                 退出
+
+任务写法：多行输入在行尾加 \，空行结束。
+中断：执行中按 Ctrl+C 取消当前任务，对话保留，可直接说"继续"。`)
 }
 
-// readInput 从标准输入读取用户输入。
-// 单行直接输入；行尾 \\ 表示续行，空行结束多行输入。
-func readInput() string {
-	reader := bufio.NewReader(os.Stdin)
-	var lines []string
+func usage(fs *flag.FlagSet) func() {
+	return func() {
+		fmt.Println(`用法：
+  go-agent [选项]                     进入交互模式
+  go-agent -p "任务" --yes            非交互执行（默认只读，写操作需 --yes）
 
-	for {
-		fmt.Print("> ")
-
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			// EOF
-			fmt.Println()
-			break
-		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		// 空行：如果没有内容，继续等待；如果有内容，结束多行输入
-		if strings.TrimSpace(line) == "" {
-			if len(lines) == 0 {
-				continue // 忽略纯空行
-			}
-			break
-		}
-
-		// 以 \ 结尾表示继续输入
-		if strings.HasSuffix(line, "\\") {
-			lines = append(lines, strings.TrimSuffix(line, "\\"))
-			continue
-		}
-
-		// 搜索特殊命令的单行输入 /exit, /help 等
-		lines = append(lines, line)
-		break
+选项：`)
+		fs.PrintDefaults()
+		fmt.Println(`
+密钥：DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY(+LLM_BASE_URL)`)
 	}
-
-	if len(lines) == 0 {
-		return ""
-	}
-	return strings.Join(lines, "\n")
 }
+
+// ============================================================================
+// 辅助
+// ============================================================================
+
+func envOr(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// errExit 表示"已完成，按 code 退出"，不是错误。
+type errExit struct{ code int }
+
+func (e errExit) Error() string { return "" }

@@ -1,0 +1,13 @@
+# 编译产物
+build/
+/go-agent
+
+# 运行期生成
+logs/
+.go-agent/
+
+# 系统与编辑器
+.DS_Store
+*.swp
+.idea/
+.vscode/

@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -30,17 +31,26 @@ const (
 // AnthropicProvider 实现 Provider 接口，对接 Anthropic Messages API。
 type AnthropicProvider struct {
 	apiKey     string
+	endpoint   string // Messages API 地址；自建网关可覆盖
 	httpClient *http.Client
 	httpLogger *log.HTTPLogger // 可选：HTTP 请求/响应文件日志
+	retry      Retry           // 限流/过载/网络抖动的重试策略
 }
 
 // NewAnthropicProvider 创建 Anthropic Provider。
 func NewAnthropicProvider(apiKey string) *AnthropicProvider {
+	return NewAnthropicProviderWithBaseURL(anthropicAPIURL, apiKey)
+}
+
+// NewAnthropicProviderWithBaseURL 创建指向自定义 Messages 兼容端点的 Provider。
+func NewAnthropicProviderWithBaseURL(endpoint, apiKey string) *AnthropicProvider {
 	return &AnthropicProvider{
-		apiKey: apiKey,
+		apiKey:   apiKey,
+		endpoint: endpoint,
 		httpClient: &http.Client{
 			Timeout: anthropicTimeout,
 		},
+		retry: DefaultRetry(),
 	}
 }
 
@@ -49,98 +59,109 @@ func (p *AnthropicProvider) SetHTTPLogger(l *log.HTTPLogger) {
 	p.httpLogger = l
 }
 
+// SetRetry 覆盖重试策略。
+func (p *AnthropicProvider) SetRetry(r Retry) {
+	p.retry = r
+}
+
 // Name 返回 "anthropic"。
 func (p *AnthropicProvider) Name() string {
 	return "anthropic"
 }
 
 // StreamingChat 发送流式请求到 Anthropic Messages API。
+//
+// 限流、过载与网络抖动会按 p.retry 退避重试；一旦已经向 onText 吐出增量，
+// 就不再重试，避免终端上出现重复内容。
 func (p *AnthropicProvider) StreamingChat(
 	ctx context.Context,
 	req ChatRequest,
 	onText func(text string),
 ) (*ChatResponse, error) {
-	startTime := time.Now()
-
-	msgReq := MessageRequest{
+	body, err := json.Marshal(MessageRequest{
 		Model:     req.Model,
 		MaxTokens: req.MaxTokens,
 		System:    req.System,
 		Messages:  req.Messages,
 		Tools:     req.Tools,
 		Stream:    true,
-	}
-
-	body, err := json.Marshal(msgReq)
+	})
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	// ---- 日志：记录请求 ----
 	if p.httpLogger != nil && p.httpLogger.Enabled() {
-		p.httpLogger.LogRequest("anthropic", "POST", anthropicAPIURL, req.RoundNumber, body)
+		p.httpLogger.LogRequest("anthropic", "POST", p.endpoint, req.RoundNumber, body)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, anthropicAPIURL, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+	var chatResp *ChatResponse
+	var streamed bool
+
+	retryErr := p.retry.do(ctx, "anthropic", req.RoundNumber,
+		func() bool { return streamed },
+		func() error {
+			streamed = false
+			startTime := time.Now()
+
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(body))
+			if err != nil {
+				return fmt.Errorf("创建 HTTP 请求失败: %w", err)
+			}
+			httpReq.Header.Set("x-api-key", p.apiKey)
+			httpReq.Header.Set("anthropic-version", anthropicVersion)
+			httpReq.Header.Set("content-type", "application/json")
+
+			resp, err := p.httpClient.Do(httpReq)
+			if err != nil {
+				p.logError(req.RoundNumber, time.Since(startTime), err.Error(), nil)
+				return transportError(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				respBody, _ := io.ReadAll(resp.Body)
+				p.logError(req.RoundNumber, time.Since(startTime),
+					fmt.Sprintf("HTTP %d", resp.StatusCode), respBody)
+				return p.parseError(resp.StatusCode, respBody, retryAfter(resp.Header))
+			}
+
+			msgResp, err := newAnthropicSSEParser().parseAnthropicStream(ctx, resp.Body, func(text string) {
+				streamed = true
+				if onText != nil {
+					onText(text)
+				}
+			})
+			elapsed := time.Since(startTime)
+			if err != nil {
+				p.logError(req.RoundNumber, elapsed, err.Error(), nil)
+				return streamError(err)
+			}
+
+			chatResp = &ChatResponse{
+				ID:           msgResp.ID,
+				Model:        msgResp.Model,
+				FinishReason: mapAnthropicStopReason(msgResp.StopReason),
+				Content:      msgResp.Content,
+				Usage:        msgResp.Usage,
+			}
+
+			if p.httpLogger != nil && p.httpLogger.Enabled() {
+				respJSON, _ := json.Marshal(chatResp)
+				p.httpLogger.LogResponse("anthropic", req.RoundNumber, elapsed, respJSON)
+			}
+			return nil
+		})
+	if retryErr != nil {
+		return nil, retryErr
 	}
-
-	httpReq.Header.Set("x-api-key", p.apiKey)
-	httpReq.Header.Set("anthropic-version", anthropicVersion)
-	httpReq.Header.Set("content-type", "application/json")
-
-	resp, err := p.httpClient.Do(httpReq)
-	if err != nil {
-		elapsed := time.Since(startTime)
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("anthropic", req.RoundNumber, elapsed, err.Error(), nil)
-		}
-		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		elapsed := time.Since(startTime)
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("anthropic", req.RoundNumber, elapsed,
-				fmt.Sprintf("HTTP %d", resp.StatusCode), respBody)
-		}
-		return nil, p.parseError(resp.StatusCode, respBody)
-	}
-
-	// 使用 Anthropic SSE 解析器处理流式响应
-	parser := &anthropicSSEParser{
-		reader: strings.NewReader(""),
-		onText: onText,
-	}
-	parser.reader = nil
-	msgResp, err := parser.parseAnthropicStream(ctx, resp.Body, onText)
-	elapsed := time.Since(startTime)
-
-	if err != nil {
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("anthropic", req.RoundNumber, elapsed, err.Error(), nil)
-		}
-		return nil, err
-	}
-
-	chatResp := &ChatResponse{
-		ID:           msgResp.ID,
-		Model:        msgResp.Model,
-		FinishReason: mapAnthropicStopReason(msgResp.StopReason),
-		Content:      msgResp.Content,
-		Usage:        msgResp.Usage,
-	}
-
-	// ---- 日志：记录响应 ----
-	if p.httpLogger != nil && p.httpLogger.Enabled() {
-		respJSON, _ := json.Marshal(chatResp)
-		p.httpLogger.LogResponse("anthropic", req.RoundNumber, elapsed, respJSON)
-	}
-
 	return chatResp, nil
+}
+
+// logError 把失败写入 HTTP 日志（若已启用）。
+func (p *AnthropicProvider) logError(round int, elapsed time.Duration, msg string, body []byte) {
+	if p.httpLogger != nil && p.httpLogger.Enabled() {
+		p.httpLogger.LogError("anthropic", round, elapsed, msg, body)
+	}
 }
 
 // ============================================================================
@@ -149,7 +170,6 @@ func (p *AnthropicProvider) StreamingChat(
 
 // anthropicSSEParser 解析 Anthropic SSE 流。
 type anthropicSSEParser struct {
-	reader *strings.Reader // 仅用于类型占位，实际使用 io.Reader
 	onText func(text string)
 
 	// 累积状态
@@ -160,6 +180,9 @@ type anthropicSSEParser struct {
 
 	// 内容块累积
 	blocks []*anthropicAccumBlock
+
+	// sawMessageStop 记录流是否正常收尾；未到 message_stop 即为提前截断。
+	sawMessageStop bool
 }
 
 // anthropicAccumBlock 一个正在累积中的 Anthropic content block。
@@ -167,10 +190,16 @@ type anthropicAccumBlock struct {
 	Index int
 	Type  string // "text" | "tool_use" | "thinking"
 
-	textBuf    strings.Builder // 文本/思考累积
-	id         string
-	name       string
-	inputJSON  strings.Builder // input_json_delta 拼接
+	textBuf   strings.Builder // 文本/思考累积
+	id        string
+	name      string
+	inputJSON strings.Builder // input_json_delta 拼接
+	partial   bool            // 参数 JSON 不完整
+}
+
+// newAnthropicSSEParser 创建 Anthropic SSE 解析器。
+func newAnthropicSSEParser() *anthropicSSEParser {
+	return &anthropicSSEParser{}
 }
 
 // parseAnthropicStream 解析 Anthropic SSE 流。
@@ -181,49 +210,61 @@ func (p *anthropicSSEParser) parseAnthropicStream(
 ) (*MessageResponse, error) {
 	p.onText = onText
 
-	// 使用 bufio 逐行读取
-	buf := make([]byte, 0, 4096)
-	tmp := make([]byte, 256)
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+
 	var eventType string
 	var dataLines []string
 
-	for {
+	flush := func() error {
+		if len(dataLines) == 0 {
+			return nil
+		}
+		err := p.handleAnthropicEvent(eventType, dataLines)
+		eventType = ""
+		dataLines = dataLines[:0]
+		return err
+	}
+
+	for scanner.Scan() {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		default:
 		}
 
-		// 读取一行
-		line, err := readLine(reader, buf, tmp)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("读取 SSE 流出错: %w", err)
-		}
+		line := scanner.Text()
 
 		// 空行表示一个事件结束
 		if line == "" {
-			if len(dataLines) > 0 {
-				if err := p.handleAnthropicEvent(eventType, dataLines); err != nil {
-					return nil, err
-				}
-				eventType = ""
-				dataLines = dataLines[:0]
+			if err := flush(); err != nil {
+				return nil, err
 			}
 			continue
 		}
 
-		if after, found := strings.CutPrefix(line, "event: "); found {
-			eventType = after
+		if after, found := strings.CutPrefix(line, "event:"); found {
+			eventType = strings.TrimSpace(after)
 			continue
 		}
 
-		if after, found := strings.CutPrefix(line, "data: "); found {
-			dataLines = append(dataLines, after)
+		if after, found := strings.CutPrefix(line, "data:"); found {
+			dataLines = append(dataLines, strings.TrimPrefix(after, " "))
 			continue
 		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("读取 SSE 流出错: %w", err)
+	}
+
+	// 流末尾可能没有空行，最后一个事件在此收尾
+	if err := flush(); err != nil {
+		return nil, err
+	}
+
+	if !p.sawMessageStop {
+		return nil, fmt.Errorf("响应流在 message_stop 之前结束")
 	}
 
 	return p.buildAnthropicResponse(), nil
@@ -303,7 +344,16 @@ func (p *anthropicSSEParser) handleAnthropicEvent(eventType string, dataLines []
 		}
 
 	case "content_block_stop":
-		// 不需要额外处理
+		if event.Index != nil && *event.Index < len(p.blocks) {
+			if b := p.blocks[*event.Index]; b != nil && b.Type == "tool_use" {
+				// 空参数视为合法（无参工具）；非空但解析失败说明 JSON 被截断。
+				raw := b.inputJSON.String()
+				var probe map[string]any
+				if raw != "" && json.Unmarshal([]byte(raw), &probe) != nil {
+					b.partial = true
+				}
+			}
+		}
 
 	case "message_delta":
 		if event.Delta != nil {
@@ -317,7 +367,7 @@ func (p *anthropicSSEParser) handleAnthropicEvent(eventType string, dataLines []
 		}
 
 	case "message_stop":
-		// 流结束
+		p.sawMessageStop = true
 	}
 	return nil
 }
@@ -357,10 +407,11 @@ func (p *anthropicSSEParser) buildAnthropicResponse() *MessageResponse {
 				input = make(map[string]any)
 			}
 			resp.Content = append(resp.Content, ContentBlock{
-				Type:  "tool_use",
-				ID:    block.id,
-				Name:  block.name,
-				Input: input,
+				Type:    "tool_use",
+				ID:      block.id,
+				Name:    block.name,
+				Input:   input,
+				Partial: block.partial,
 			})
 		}
 	}
@@ -372,61 +423,53 @@ func (p *anthropicSSEParser) buildAnthropicResponse() *MessageResponse {
 // 辅助函数
 // ============================================================================
 
-// readLine 从 io.Reader 读取一行（处理 \r\n 和 \n）。
-func readLine(r io.Reader, buf []byte, tmp []byte) (string, error) {
-	buf = buf[:0]
-	for {
-		n, err := r.Read(tmp)
-		for i := 0; i < n; i++ {
-			b := tmp[i]
-			if b == '\n' {
-				return string(buf), nil
-			}
-			if b != '\r' {
-				buf = append(buf, b)
-			}
-		}
-		if err != nil {
-			if err == io.EOF && len(buf) > 0 {
-				return string(buf), io.EOF
-			}
-			return "", err
-		}
-	}
-}
-
 // mapAnthropicStopReason 映射 Anthropic stop_reason → 内部 FinishReason。
 func mapAnthropicStopReason(reason string) string {
 	switch reason {
-	case "end_turn":
+	case "end_turn", "stop_sequence", "pause_turn", "refusal":
 		return FinishStop
 	case "tool_use":
 		return FinishToolCalls
 	case "max_tokens":
 		return FinishLength
+	case "":
+		return FinishStop
 	default:
 		return FinishError
 	}
 }
 
-// parseError 解析 Anthropic API 错误响应。
-func (p *AnthropicProvider) parseError(statusCode int, body []byte) error {
+// parseError 解析 Anthropic API 错误响应，并标注是否可重试。
+func (p *AnthropicProvider) parseError(statusCode int, body []byte, hint time.Duration) error {
+	// 响应体不是 JSON 时（网关错误页、纯文本）也要走下面的状态码分支，
+	// 否则用户只看到一句 "API 错误"，分不清是限流还是服务挂了。
 	var errResp ErrorResponse
-	if err := json.Unmarshal(body, &errResp); err != nil {
-		return fmt.Errorf("API 错误 (HTTP %d): %s", statusCode, string(body))
+	if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error.Message == "" {
+		errResp.Error.Message = truncateBody(body)
 	}
 
-	apiErr := errResp.Error
+	msg := errResp.Error.Message
 	switch statusCode {
 	case 401:
-		return fmt.Errorf("认证失败 (401): %s — 请检查 ANTHROPIC_API_KEY 是否正确", apiErr.Message)
-	case 429:
-		return fmt.Errorf("请求频率限制 (429): %s — 请稍后重试", apiErr.Message)
+		return apiError(statusCode, body, fmt.Sprintf("认证失败 (401): %s — 请检查 ANTHROPIC_API_KEY 是否正确", msg), hint)
 	case 400:
-		return fmt.Errorf("请求参数错误 (400): %s", apiErr.Message)
-	case 500, 502, 503:
-		return fmt.Errorf("服务器错误 (HTTP %d): %s — 请稍后重试", statusCode, apiErr.Message)
+		return apiError(statusCode, body, fmt.Sprintf("请求参数错误 (400): %s", msg), hint)
+	case 429:
+		return apiError(statusCode, body, fmt.Sprintf("请求频率限制 (429): %s", msg), hint)
+	case statusOverloaded:
+		return apiError(statusCode, body, fmt.Sprintf("服务过载 (529): %s", msg), hint)
+	case 500, 502, 503, 504:
+		return apiError(statusCode, body, fmt.Sprintf("服务器错误 (HTTP %d): %s", statusCode, msg), hint)
 	default:
-		return fmt.Errorf("API 错误 (HTTP %d): %s (%s)", statusCode, apiErr.Message, apiErr.Type)
+		return apiError(statusCode, body, fmt.Sprintf("API 错误 (HTTP %d): %s (%s)", statusCode, msg, errResp.Error.Type), hint)
 	}
+}
+
+// truncateBody 用于把错误响应体放进日志/错误文案。
+func truncateBody(body []byte) string {
+	const max = 500
+	if len(body) <= max {
+		return string(body)
+	}
+	return string(body[:max]) + "..."
 }

@@ -58,6 +58,11 @@ type ContentBlock struct {
 	ToolUseID string `json:"tool_use_id,omitempty"`
 	Content   any    `json:"content,omitempty"` // 可以是 string 或 []ContentBlock
 	IsError   *bool  `json:"is_error,omitempty"`
+
+	// --- 仅内部使用，不参与序列化 ---
+	// Partial 表示这个 tool_use 的参数 JSON 没有完整到达（通常因为输出撞上
+	// max_tokens）。这样的调用不能被执行，也不应留在对话历史里。
+	Partial bool `json:"-"`
 }
 
 // ============================================================================
@@ -116,6 +121,9 @@ type Usage struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
 }
+
+// Total 返回本次用量的总 token 数。
+func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
 
 // ============================================================================
 // 错误响应

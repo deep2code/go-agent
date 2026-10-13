@@ -32,16 +32,24 @@ type DeepSeekProvider struct {
 	baseURL    string
 	httpClient *http.Client
 	httpLogger *log.HTTPLogger // 可选：HTTP 请求/响应文件日志
+	retry      Retry           // 限流/过载/网络抖动的重试策略
 }
 
 // NewDeepSeekProvider 创建 DeepSeek Provider。
 func NewDeepSeekProvider(apiKey string) *DeepSeekProvider {
+	return NewDeepSeekProviderWithBaseURL(deepseekBaseURL, apiKey)
+}
+
+// NewDeepSeekProviderWithBaseURL 创建指向自定义 OpenAI 兼容端点的 Provider。
+// baseURL 用于自建网关或其他厂商的服务地址。
+func NewDeepSeekProviderWithBaseURL(baseURL, apiKey string) *DeepSeekProvider {
 	return &DeepSeekProvider{
 		apiKey:  apiKey,
-		baseURL: deepseekBaseURL,
+		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
 			Timeout: deepseekTimeout,
 		},
+		retry: DefaultRetry(),
 	}
 }
 
@@ -51,83 +59,97 @@ func (p *DeepSeekProvider) SetHTTPLogger(l *log.HTTPLogger) {
 	p.httpLogger = l
 }
 
+// SetRetry 覆盖重试策略。
+func (p *DeepSeekProvider) SetRetry(r Retry) {
+	p.retry = r
+}
+
 // Name 返回 "deepseek"。
 func (p *DeepSeekProvider) Name() string {
 	return "deepseek"
 }
 
 // StreamingChat 发送流式请求到 DeepSeek Chat Completions API。
+//
+// 限流、过载与网络抖动会按 p.retry 退避重试；一旦已向用户吐出增量就不再重试。
 func (p *DeepSeekProvider) StreamingChat(
 	ctx context.Context,
 	req ChatRequest,
 	onText func(text string),
 ) (*ChatResponse, error) {
-	startTime := time.Now()
-
-	// 1. 将内部类型转换为 OpenAI 格式
-	oaReq := p.toOpenAIRequest(req)
-
-	body, err := json.Marshal(oaReq)
+	body, err := json.Marshal(p.toOpenAIRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
 
-	// ---- 日志：记录请求 ----
 	url := p.baseURL + "/chat/completions"
 	if p.httpLogger != nil && p.httpLogger.Enabled() {
 		p.httpLogger.LogRequest("deepseek", "POST", url, req.RoundNumber, body)
 	}
 
-	// 2. 发送 HTTP 请求
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		url, bytes.NewReader(body))
-	if err != nil {
-		return nil, fmt.Errorf("创建 HTTP 请求失败: %w", err)
+	var chatResp *ChatResponse
+	var streamed bool
+
+	retryErr := p.retry.do(ctx, "deepseek", req.RoundNumber,
+		func() bool { return streamed },
+		func() error {
+			streamed = false
+			startTime := time.Now()
+
+			httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+			if err != nil {
+				return fmt.Errorf("创建 HTTP 请求失败: %w", err)
+			}
+			httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Accept", "text/event-stream")
+
+			resp, err := p.httpClient.Do(httpReq)
+			if err != nil {
+				p.logError(req.RoundNumber, time.Since(startTime), err.Error(), nil)
+				return transportError(err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				respBody, _ := io.ReadAll(resp.Body)
+				p.logError(req.RoundNumber, time.Since(startTime),
+					fmt.Sprintf("HTTP %d", resp.StatusCode), respBody)
+				return p.parseError(resp.StatusCode, respBody, retryAfter(resp.Header))
+			}
+
+			parser := newOpenAISSEParser(resp.Body, func(text string) {
+				streamed = true
+				if onText != nil {
+					onText(text)
+				}
+			})
+			out, err := parser.parse(ctx)
+			elapsed := time.Since(startTime)
+			if err != nil {
+				p.logError(req.RoundNumber, elapsed, err.Error(), nil)
+				return streamError(err)
+			}
+
+			chatResp = out
+
+			if p.httpLogger != nil && p.httpLogger.Enabled() {
+				respJSON, _ := json.Marshal(chatResp)
+				p.httpLogger.LogResponse("deepseek", req.RoundNumber, elapsed, respJSON)
+			}
+			return nil
+		})
+	if retryErr != nil {
+		return nil, retryErr
 	}
-
-	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Accept", "text/event-stream")
-
-	resp, err := p.httpClient.Do(httpReq)
-	if err != nil {
-		elapsed := time.Since(startTime)
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("deepseek", req.RoundNumber, elapsed, err.Error(), nil)
-		}
-		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		elapsed := time.Since(startTime)
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("deepseek", req.RoundNumber, elapsed,
-				fmt.Sprintf("HTTP %d", resp.StatusCode), respBody)
-		}
-		return nil, p.parseError(resp.StatusCode, respBody)
-	}
-
-	// 3. 使用 OpenAI SSE 解析器处理流式响应
-	parser := newOpenAISSEParser(resp.Body, onText)
-	chatResp, err := parser.parse(ctx)
-	elapsed := time.Since(startTime)
-
-	if err != nil {
-		if p.httpLogger != nil && p.httpLogger.Enabled() {
-			p.httpLogger.LogError("deepseek", req.RoundNumber, elapsed, err.Error(), nil)
-		}
-		return nil, err
-	}
-
-	// ---- 日志：记录响应 ----
-	if p.httpLogger != nil && p.httpLogger.Enabled() {
-		respJSON, _ := json.Marshal(chatResp)
-		p.httpLogger.LogResponse("deepseek", req.RoundNumber, elapsed, respJSON)
-	}
-
 	return chatResp, nil
+}
+
+// logError 把失败写入 HTTP 日志（若已启用）。
+func (p *DeepSeekProvider) logError(round int, elapsed time.Duration, msg string, body []byte) {
+	if p.httpLogger != nil && p.httpLogger.Enabled() {
+		p.httpLogger.LogError("deepseek", round, elapsed, msg, body)
+	}
 }
 
 // ============================================================================
@@ -135,11 +157,18 @@ func (p *DeepSeekProvider) StreamingChat(
 // ============================================================================
 
 type openAIChatRequest struct {
-	Model     string          `json:"model"`
-	Messages  []openAIMessage `json:"messages"`
-	Tools     []openAIToolDef `json:"tools,omitempty"`
-	Stream    bool            `json:"stream"`
-	MaxTokens int             `json:"max_tokens,omitempty"`
+	Model         string           `json:"model"`
+	Messages      []openAIMessage  `json:"messages"`
+	Tools         []openAIToolDef  `json:"tools,omitempty"`
+	Stream        bool             `json:"stream"`
+	StreamOptions *openAIStreamOpt `json:"stream_options,omitempty"`
+	MaxTokens     int              `json:"max_tokens,omitempty"`
+}
+
+// openAIStreamOpt 让服务端在流的最后一个 chunk 里带上用量统计，
+// 否则流式调用拿不到 token 数。
+type openAIStreamOpt struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type openAIMessage struct {
@@ -183,9 +212,10 @@ type openAIErrorResponse struct {
 // toOpenAIRequest 将内部 ChatRequest 转换为 OpenAI 格式。
 func (p *DeepSeekProvider) toOpenAIRequest(req ChatRequest) openAIChatRequest {
 	oaReq := openAIChatRequest{
-		Model:     req.Model,
-		Stream:    true,
-		MaxTokens: req.MaxTokens,
+		Model:         req.Model,
+		Stream:        true,
+		StreamOptions: &openAIStreamOpt{IncludeUsage: true},
+		MaxTokens:     req.MaxTokens,
 	}
 
 	if req.System != "" {
@@ -295,23 +325,31 @@ func (p *DeepSeekProvider) convertAssistantMessage(msg Message) []openAIMessage 
 // 错误处理
 // ============================================================================
 
-func (p *DeepSeekProvider) parseError(statusCode int, body []byte) error {
+// parseError 解析 OpenAI 兼容的错误响应，并标注是否可重试。
+func (p *DeepSeekProvider) parseError(statusCode int, body []byte, hint time.Duration) error {
+	// 非 JSON 响应体（网关错误页、纯文本）也要走下面的状态码分支
 	var errResp openAIErrorResponse
-	if err := json.Unmarshal(body, &errResp); err != nil {
-		return fmt.Errorf("API 错误 (HTTP %d): %s", statusCode, string(body))
+	if err := json.Unmarshal(body, &errResp); err != nil || errResp.Error.Message == "" {
+		errResp.Error.Message = truncateBody(body)
 	}
 
 	e := errResp.Error
+	msg := e.Message
+	if msg == "" {
+		msg = e.Type
+	}
 	switch statusCode {
 	case 401:
-		return fmt.Errorf("认证失败 (401): %s — 请检查 DEEPSEEK_API_KEY 是否正确", e.Message)
-	case 429:
-		return fmt.Errorf("请求频率限制 (429): %s — 请稍后重试", e.Message)
+		return apiError(statusCode, body, fmt.Sprintf("认证失败 (401): %s — 请检查 DEEPSEEK_API_KEY 是否正确", msg), hint)
 	case 400:
-		return fmt.Errorf("请求参数错误 (400): %s", e.Message)
-	case 500, 502, 503:
-		return fmt.Errorf("服务器错误 (HTTP %d): %s — 请稍后重试", statusCode, e.Message)
+		return apiError(statusCode, body, fmt.Sprintf("请求参数错误 (400): %s", msg), hint)
+	case 402:
+		return apiError(statusCode, body, fmt.Sprintf("余额不足 (402): %s", msg), hint)
+	case 429:
+		return apiError(statusCode, body, fmt.Sprintf("请求频率限制 (429): %s", msg), hint)
+	case 500, 502, 503, 504:
+		return apiError(statusCode, body, fmt.Sprintf("服务器错误 (HTTP %d): %s", statusCode, msg), hint)
 	default:
-		return fmt.Errorf("API 错误 (HTTP %d): %s (%s)", statusCode, e.Message, e.Code)
+		return apiError(statusCode, body, fmt.Sprintf("API 错误 (HTTP %d): %s (%s)", statusCode, msg, e.Code), hint)
 	}
 }

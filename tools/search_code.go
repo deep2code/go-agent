@@ -26,6 +26,12 @@ func NewSearchCodeTool(workingDir string) *SearchCodeTool {
 	return &SearchCodeTool{workingDir: workingDir}
 }
 
+// Name 返回工具名。
+func (t *SearchCodeTool) Name() string { return "search_code" }
+
+// Mutating 报告该工具不会改动文件系统。
+func (t *SearchCodeTool) Mutating() bool { return false }
+
 // Definition 返回 search_code 工具的 JSON Schema。
 func (t *SearchCodeTool) Definition() llm.ToolDef {
 	return llm.ToolDef{
@@ -69,9 +75,13 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 		fileGlob = g
 	}
 
-	absSearchDir, err := t.safePath(searchDir)
+	absSearchDir, err := resolveSafe(t.workingDir, searchDir, false)
 	if err != nil {
 		return "", err
+	}
+	absWorkingDir, err := filepath.Abs(t.workingDir)
+	if err != nil {
+		return "", fmt.Errorf("无法解析工作目录: %w", err)
 	}
 
 	// 编译正则
@@ -125,6 +135,11 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 			return nil
 		}
 
+		// 跳过超大文件，避免为了搜索把内存吃满
+		if info, err := d.Info(); err == nil && info.Size() > maxSearchFileBytes {
+			return nil
+		}
+
 		totalScanned++
 
 		// 搜索文件内容
@@ -133,7 +148,10 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 			return nil
 		}
 
-		relPath, _ := filepath.Rel(absSearchDir, path)
+		relPath, err := filepath.Rel(absWorkingDir, path)
+		if err != nil {
+			relPath = path
+		}
 		lines := strings.Split(string(data), "\n")
 		for lineNo, line := range lines {
 			if re.MatchString(line) {
@@ -201,22 +219,5 @@ func isBinary(path string) bool {
 	return false
 }
 
-func (t *SearchCodeTool) safePath(relPath string) (string, error) {
-	if filepath.IsAbs(relPath) {
-		return "", fmt.Errorf("不允许使用绝对路径: %s", relPath)
-	}
-
-	absWorkingDir, err := filepath.Abs(t.workingDir)
-	if err != nil {
-		return "", fmt.Errorf("无法获取工作目录的绝对路径: %w", err)
-	}
-
-	absPath := filepath.Join(absWorkingDir, relPath)
-	absPath = filepath.Clean(absPath)
-
-	if !strings.HasPrefix(absPath, absWorkingDir+string(filepath.Separator)) && absPath != absWorkingDir {
-		return "", fmt.Errorf("路径越界: %s 不在工作目录内", relPath)
-	}
-
-	return absPath, nil
-}
+// maxSearchFileBytes 单个文件参与内容搜索的大小上限。
+const maxSearchFileBytes = 2 * 1024 * 1024

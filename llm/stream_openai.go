@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -16,9 +17,10 @@ import (
 // openaiSSEParser 解析 OpenAI 兼容格式的 SSE 流式响应。
 //
 // SSE 事件格式:
-//   data: {"id":"...","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
-//   data: {"id":"...","choices":[{"index":0,"delta":{"tool_calls":[...]},"finish_reason":null}]}
-//   data: [DONE]
+//
+//	data: {"id":"...","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}
+//	data: {"id":"...","choices":[{"index":0,"delta":{"tool_calls":[...]},"finish_reason":null}]}
+//	data: [DONE]
 //
 // 工具调用参数被拆成多个 JSON 片段流式传输，需要在客户端按 index 分组拼接。
 type openaiSSEParser struct {
@@ -29,6 +31,8 @@ type openaiSSEParser struct {
 	messageID    string
 	model        string
 	finishReason string
+	sawDone      bool
+	usage        Usage
 
 	// 内容累积
 	textBuf strings.Builder
@@ -64,37 +68,44 @@ func (p *openaiSSEParser) parse(ctx context.Context) (*ChatResponse, error) {
 		}
 
 		line, err := p.reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+		if err != nil && err != io.EOF {
 			return nil, fmt.Errorf("读取 SSE 流出错: %w", err)
 		}
-
-		line = strings.TrimRight(line, "\r\n")
-
-		// 跳过空行和非 data 行
-		if line == "" {
-			continue
+		if line != "" {
+			if err := p.handleLine(strings.TrimRight(line, "\r\n")); err != nil {
+				return nil, err
+			}
 		}
-
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-
-		data := strings.TrimPrefix(line, "data: ")
-
-		// 流结束标记
-		if data == "[DONE]" {
+		if err == io.EOF {
 			break
-		}
-
-		if err := p.processChunk(data); err != nil {
-			return nil, err
 		}
 	}
 
+	// 没收到 [DONE] 也没收到 finish_reason，说明连接被中途掐断，
+	// 此时累积到的内容可能是半条工具调用，必须让上层重试而不是继续处理。
+	if !p.sawDone && p.finishReason == "" {
+		return nil, fmt.Errorf("响应流提前结束（未收到 [DONE]）")
+	}
+
 	return p.buildResponse(), nil
+}
+
+// handleLine 处理一行 SSE 文本。
+func (p *openaiSSEParser) handleLine(line string) error {
+	if line == "" {
+		return nil
+	}
+	// 兼容 "data: {...}" 与 "data:{...}" 两种写法
+	after, found := strings.CutPrefix(line, "data:")
+	if !found {
+		return nil
+	}
+	data := strings.TrimLeft(after, " ")
+	if data == "[DONE]" {
+		p.sawDone = true
+		return nil
+	}
+	return p.processChunk(data)
 }
 
 // processChunk 处理一个 data chunk。
@@ -110,6 +121,12 @@ func (p *openaiSSEParser) processChunk(jsonData string) error {
 	}
 	if chunk.Model != "" {
 		p.model = chunk.Model
+	}
+
+	// 捕获用量：带 stream_options.include_usage 时，最后一个 chunk 才给出
+	if chunk.Usage != nil {
+		p.usage.InputTokens = chunk.Usage.PromptTokens
+		p.usage.OutputTokens = chunk.Usage.CompletionTokens
 	}
 
 	// 处理 choices
@@ -169,6 +186,7 @@ func (p *openaiSSEParser) buildResponse() *ChatResponse {
 		ID:           p.messageID,
 		Model:        p.model,
 		FinishReason: mapFinishReason(p.finishReason),
+		Usage:        p.usage,
 	}
 
 	// 文本内容
@@ -179,12 +197,15 @@ func (p *openaiSSEParser) buildResponse() *ChatResponse {
 		})
 	}
 
-	// 工具调用内容（按 index 排序）
-	for i := 0; i < len(p.toolCalls); i++ {
-		acc, ok := p.toolCalls[i]
-		if !ok {
-			continue
-		}
+	// 工具调用内容（按 index 升序，index 可能不连续）
+	indexes := make([]int, 0, len(p.toolCalls))
+	for idx := range p.toolCalls {
+		indexes = append(indexes, idx)
+	}
+	sort.Ints(indexes)
+
+	for _, idx := range indexes {
+		acc := p.toolCalls[idx]
 
 		// 将累积的 arguments JSON 字符串解析为 map
 		argsStr := acc.Arguments.String()
@@ -196,15 +217,30 @@ func (p *openaiSSEParser) buildResponse() *ChatResponse {
 			input = make(map[string]any)
 		}
 
+		// 非空但解析失败的参数，是被 max_tokens 截断的半条 JSON
+		partial := isPartialJSON(argsStr)
+
 		resp.Content = append(resp.Content, ContentBlock{
-			Type:  "tool_use",
-			ID:    acc.ID,
-			Name:  acc.Name,
-			Input: input,
+			Type:    "tool_use",
+			ID:      acc.ID,
+			Name:    acc.Name,
+			Input:   input,
+			Partial: partial,
 		})
 	}
 
 	return resp
+}
+
+// isPartialJSON 判断字符串是否像一段被截断的 JSON 对象。
+// 空串与完整对象都返回 false。
+func isPartialJSON(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	var probe map[string]any
+	return json.Unmarshal([]byte(s), &probe) != nil
 }
 
 // ============================================================================
@@ -213,24 +249,31 @@ func (p *openaiSSEParser) buildResponse() *ChatResponse {
 
 // openAIStreamChunk 单个 SSE data chunk 的 JSON 结构。
 type openAIStreamChunk struct {
-	ID      string                  `json:"id"`
-	Object  string                  `json:"object"`
-	Model   string                  `json:"model"`
-	Created int64                   `json:"created"`
-	Choices []openAIStreamChoice    `json:"choices"`
+	ID      string               `json:"id"`
+	Object  string               `json:"object"`
+	Model   string               `json:"model"`
+	Created int64                `json:"created"`
+	Usage   *openAIStreamUsage   `json:"usage"`
+	Choices []openAIStreamChoice `json:"choices"`
+}
+
+// openAIStreamUsage 流式响应最后一个 chunk 里的用量统计。
+type openAIStreamUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
 }
 
 // openAIStreamChoice chunk 中的 choice。
 type openAIStreamChoice struct {
-	Index        int              `json:"index"`
+	Index        int               `json:"index"`
 	Delta        openAIStreamDelta `json:"delta"`
-	FinishReason string           `json:"finish_reason"`
+	FinishReason string            `json:"finish_reason"`
 }
 
 // openAIStreamDelta choice 中的 delta。
 type openAIStreamDelta struct {
-	Role      string               `json:"role,omitempty"`
-	Content   string               `json:"content,omitempty"`
+	Role      string                 `json:"role,omitempty"`
+	Content   string                 `json:"content,omitempty"`
 	ToolCalls []openAIStreamToolCall `json:"tool_calls,omitempty"`
 }
 
@@ -262,7 +305,7 @@ func mapFinishReason(reason string) string {
 	case "length":
 		return FinishLength
 	case "":
-		return "" // 流进行中
+		return FinishStop
 	default:
 		return FinishError
 	}
