@@ -8,6 +8,7 @@ import (
 
 	"go-agent/llm"
 	"go-agent/log"
+	"go-agent/tools"
 )
 
 // ============================================================================
@@ -318,6 +319,195 @@ func (a *Agent) Pointerize(messages []llm.Message) int {
 		}
 	}
 	return total
+}
+
+// l2ParamFrom 是 tool_use 大正文参数的瘦身门槛：低于它的参数不值得动，
+// 换掉省不下几个字节，却会让那次改动在历史里更难追踪。
+const l2ParamFrom = 1500
+
+// SlimBodyParams 把历史里**较早的、已经成功执行的**写入调用参数中的大正文换成一行说明，
+// 返回省下的字节数。
+//
+// 这一级治的是 Pointerize 管不到的那一半：Pointerize 换的是 tool_result 的正文，
+// 而 write_file 那次调用里最占地方的往往是 tool_use 的 content 参数——几千字节的文件全文
+// 由模型亲手写出来，写完就躺在磁盘上了，却在此后每一轮都被重复发送。
+//
+// 四道门，缺一不可：
+//  1. 工具自己声明了这个参数是大正文（tools.BodyParamTool）——没声明就一律不动，
+//     run_command 的 command 再长也不能换，那是"执行过什么"的唯一记录；
+//  2. 配对的 tool_result 存在且不是错误：写失败时参数是模型下一轮重试的唯一依据，
+//     而且审批门还在等确认时 diff 要从参数里生成；
+//  3. 不属于最近 l2KeepRecent 次调用：那几轮正是模型下一步动作的参照；
+//  4. 参数值超过 l2ParamFrom。
+//
+// 换掉之后不另存一份到 .go-agent/toolcache：全文就在 file_path 指向的文件里，
+// 再抄一份到缓存目录只是把同一份内容落两次盘，还多出一个可能被翻看的副本。
+func (a *Agent) SlimBodyParams(messages []llm.Message) int {
+	statuses := resultStatuses(messages)
+
+	total := 0
+	seen := 0
+	// 从后往前数，最近几次调用不动
+	for i := len(messages) - 1; i >= 0; i-- {
+		for j := len(messages[i].Content) - 1; j >= 0; j-- {
+			b := &messages[i].Content[j]
+			if b.Type != "tool_use" {
+				continue
+			}
+			seen++
+			if seen <= l2KeepRecent {
+				continue
+			}
+			tool, ok := a.registry.Get(b.Name)
+			if !ok {
+				continue
+			}
+			names := tools.BodyParamNames(tool)
+			if len(names) == 0 || b.Input == nil {
+				continue
+			}
+			res, ok := statuses[b.ID]
+			if !ok || res.isError {
+				continue
+			}
+			replaced := make(map[string]string)
+			for _, name := range names {
+				v, ok := b.Input[name].(string)
+				if !ok || len(v) < l2ParamFrom {
+					continue
+				}
+				replaced[name] = paramNote(b.Input, name, v)
+			}
+			if len(replaced) == 0 {
+				continue
+			}
+			// 换整个 map 而不是往原 map 上写：Input 是引用类型，
+			// 历史、会话快照、子 agent 可能共用同一份，就地改会让别人看到变了的内容。
+			fresh := make(map[string]any, len(b.Input))
+			for k, v := range b.Input {
+				fresh[k] = v
+			}
+			for k, v := range replaced {
+				total += len(fresh[k].(string)) - len(v)
+				fresh[k] = v
+			}
+			b.Input = fresh
+		}
+	}
+	return total
+}
+
+// paramNote 生成替换大正文参数的那句话：说清省掉了什么、去哪儿能拿回来。
+func paramNote(input map[string]any, name, value string) string {
+	path, _ := input["file_path"].(string)
+	if path == "" {
+		return fmt.Sprintf("（调用已成功，参数 %s 的 %d 字节正文不再重复发送；需要时重新发起同样的调用）",
+			name, len(value))
+	}
+	return fmt.Sprintf("（调用已成功，参数 %s 的 %d 字节正文已落盘在 %s，不再重复发送；需要时用 read_file 读它）",
+		name, len(value), path)
+}
+
+// resultOutcome 记录一个 tool_use 有没有拿到成功结果。
+type resultOutcome struct {
+	isError bool
+}
+
+// resultStatuses 按 tool_use ID 收集所有 tool_result 的成败。
+func resultStatuses(messages []llm.Message) map[string]resultOutcome {
+	out := make(map[string]resultOutcome)
+	for _, m := range messages {
+		for _, b := range m.Content {
+			if b.Type != "tool_result" {
+				continue
+			}
+			out[b.ToolUseID] = resultOutcome{isError: b.IsError != nil && *b.IsError}
+		}
+	}
+	return out
+}
+
+// dupMinBytes 是去重的最小结果长度：比它短的调用不值得省略，
+// 省不下几个字节，却多让模型背一个"这次怎么没返回内容"的疑问。
+const dupMinBytes = 800
+
+// duplicateNotice 检查这次调用的结果是否和历史里某一次**同名同参**调用的结果逐字相同，
+// 是则返回一句省略说明，否则返回空串。空串意味着"照常把全文发出去"。
+//
+// 治的是反复读同一个文件：一个任务里模型常为不同目的把同一份源码读上三四遍，
+// 每一遍都是几千字节原样进历史、此后再发三遍。
+//
+// 判定只用"逐字相等"这一条，但这一条同时兜住了三种风险，所以不需要额外的闸门：
+//   - 文件被改过：新的 read_file 输出必然不同，照常发全文；
+//   - 历史里那一份已被 L2 指针化或被折叠成占位：它的文本是"头 + 指针 + 尾"，
+//     和全文不可能相等，所以不会把内容指向一份其实看不见的历史；
+//   - 上一次是错误结果：带 is_error，不参与比较。
+//
+// 因此它是**自愈**的：那一份一旦在后续某轮被折叠掉，下一次同样的调用就会重新发送全文。
+func (a *Agent) duplicateNotice(name string, input map[string]any, result string) string {
+	if len(result) < dupMinBytes {
+		return ""
+	}
+	// 只给只读工具去重：写类工具的结果是"改动已经发生"的凭据，哪怕内容雷同也要逐条留在历史里。
+	tool, ok := a.registry.Get(name)
+	if !ok || tool.Mutating() {
+		return ""
+	}
+	target := name + "\x00" + argKey(input)
+
+	calls := make(map[string]string) // tool_use ID -> 工具名 + 规范化参数
+	for _, m := range a.history {
+		for _, b := range m.Content {
+			if b.Type == "tool_use" {
+				calls[b.ID] = b.Name + "\x00" + argKey(b.Input)
+			}
+		}
+	}
+	for _, m := range a.history {
+		for _, b := range m.Content {
+			if b.Type != "tool_result" || calls[b.ToolUseID] != target {
+				continue
+			}
+			if b.IsError != nil && *b.IsError {
+				continue
+			}
+			if toolResultText(b) != result {
+				continue
+			}
+			return dupNoticeText(name, input)
+		}
+	}
+	return ""
+}
+
+// dupNoticeText 给出省略说明，并把回读路径说清楚。
+func dupNoticeText(name string, input map[string]any) string {
+	where := "同名同参的更早一次调用"
+	if path, _ := input["file_path"].(string); path != "" {
+		where = fmt.Sprintf("更早一次对 %s 的调用", path)
+	}
+	return fmt.Sprintf("（本次 %s 的结果与%s逐字相同，已省略不再重复发送；那一份原文就在上方历史里，"+
+		"需要时回读它或重新调用本工具）", name, where)
+}
+
+// argKey 把参数规范化成可比较的字符串：键按字母序，值全量保留。
+//
+// 值不能截断——两个只在截断点之后才不同的参数会被判成同一个，
+// 那等于把两份不同的文件内容当成一份，省略掉的就是真数据。
+func argKey(input map[string]any) string {
+	if len(input) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	var sb strings.Builder
+	for _, k := range keys {
+		fmt.Fprintf(&sb, "%s=%v\x00", k, input[k])
+	}
+	return sb.String()
 }
 
 // Summarizer 把即将被丢弃的一段历史压缩成可读摘要。

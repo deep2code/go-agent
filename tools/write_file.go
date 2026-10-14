@@ -40,6 +40,10 @@ func (t *WriteFileTool) Name() string { return "write_file" }
 // Mutating 报告该工具会写文件。
 func (t *WriteFileTool) Mutating() bool { return true }
 
+// BodyParams 声明 content 是大正文参数：写入成功后全文已经在磁盘上，
+// 历史里再留一份等于此后每一轮重复付费。
+func (t *WriteFileTool) BodyParams() []string { return []string{"content"} }
+
 // Definition 返回 write_file 工具的 JSON Schema。
 func (t *WriteFileTool) Definition() llm.ToolDef {
 	return llm.ToolDef{

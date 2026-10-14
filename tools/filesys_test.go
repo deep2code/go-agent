@@ -148,7 +148,7 @@ func TestReadFilePaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "     1 | package main") {
+	if !strings.Contains(out, "1| package main") {
 		t.Errorf("应带行号: %q", out)
 	}
 
@@ -166,7 +166,7 @@ func TestReadFilePaging(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "  2001 |") || strings.Contains(out, "  2012 |") {
+	if !strings.Contains(out, "2001| ") || strings.Contains(out, "2011| ") {
 		t.Errorf("start_line/max_lines 没生效: %q", out[:200])
 	}
 
@@ -191,6 +191,34 @@ func TestReadFilePaging(t *testing.T) {
 	}
 	if _, err := r.Execute(context.Background(), map[string]any{"file_path": "/etc/passwd"}); err == nil {
 		t.Error("绝对路径应报错")
+	}
+}
+
+// 行号前缀是**按行收费**的：一次几百行的读取，前缀宽窄直接决定这次调用占多少上下文，
+// 而这部分对模型毫无信息量。这里把每行的开销钉住，别让它悄悄长回去。
+func TestReadFileLinePrefixIsLean(t *testing.T) {
+	dir := t.TempDir()
+	const lines = 200
+	var sb strings.Builder
+	for i := 0; i < lines; i++ {
+		sb.WriteString("fmt.Println(\"hello, world\")\n")
+	}
+	content := strings.TrimSuffix(sb.String(), "\n")
+	if err := os.WriteFile(filepath.Join(dir, "p.go"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := NewReadFileTool(dir, NewFileState()).Execute(
+		context.Background(), map[string]any{"file_path": "p.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(out, "     1 | ") {
+		t.Error("定宽行号又回来了")
+	}
+	body := out[strings.Index(out, "\n\n")+2:] // 去掉表头
+	if overhead := len(body) - len(content); overhead > lines*6 {
+		t.Errorf("行号前缀太宽：每行平均 %d 字节，应不超过 6", overhead/lines)
 	}
 }
 

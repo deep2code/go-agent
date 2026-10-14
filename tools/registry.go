@@ -62,6 +62,35 @@ func Parallelizable(t Tool) bool {
 	return !t.Mutating() && ps.ParallelSafe()
 }
 
+// BodyParamTool 是可选接口：实现它，声明"某个参数的值是一大块正文，
+// 而这次调用成功之后，正文的每一个字节都已经在磁盘上了"。
+//
+// 缺省是"没有大正文参数"——没声明就没人动它，最坏结果只是历史里多留一份全文，
+// 也就是慢和贵，不会变危险。
+//
+// 为什么只该写在成功落盘之后：写入类参数是模型自己生成的，换掉它等于把"这次改动写过什么"
+// 的唯一记录从历史里拿走。只有在拿到成功结果之后，这份记录才真的有磁盘上的文件兜底。
+// 还在等审批的调用不能换——diff 要从参数里生成。
+//
+// 只声明**能回读**的那一侧。edit_file 声明 new_string 而不声明 old_string：
+// 成功后新内容在文件里，read_file 就能拿回来；old_string 已经被替换掉了，
+// 历史是它唯一的去处，砍掉就再也找不回。
+type BodyParamTool interface {
+	Tool
+
+	// BodyParams 返回参数名：其值在工具成功执行后可从磁盘回读，不必常驻历史。
+	BodyParams() []string
+}
+
+// BodyParamNames 返回工具声明的大正文参数名；没声明就是空。
+func BodyParamNames(t Tool) []string {
+	bp, ok := t.(BodyParamTool)
+	if !ok {
+		return nil
+	}
+	return bp.BodyParams()
+}
+
 // Registry 管理所有可用工具的集合。
 type Registry struct {
 	tools map[string]Tool // name -> Tool

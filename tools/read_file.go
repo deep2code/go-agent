@@ -115,7 +115,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 		if len(line) > maxLineBytes {
 			line = line[:maxLineBytes] + fmt.Sprintf(" …（本行共 %d 字节，已截断）", len(lines[i]))
 		}
-		sb.WriteString(fmt.Sprintf("%6d | %s\n", i+1, line))
+		// 行号按实际宽度输出：定宽的 "%6d | " 让每行多背 9 个字节，
+		// 一次 400 行的读取里光前缀就占掉两成——行号是给模型定位用的，不是给终端对齐用的。
+		sb.WriteString(fmt.Sprintf("%d| %s\n", i+1, line))
 	}
 
 	if end < len(lines) {

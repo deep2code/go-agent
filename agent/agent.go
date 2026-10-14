@@ -429,6 +429,11 @@ func (a *Agent) prepareForSend(ctx context.Context) (int, error) {
 		log.Info("早期工具输出已换成指针，省下 %d 字节（完整内容仍在 .go-agent/toolcache 里可回读）", freed)
 	}
 
+	// 写入类参数跟着一起瘦身，但门更严：只砍已经拿到成功结果、且工具自己声明过"这是大正文"的。
+	if freed := a.SlimBodyParams(a.history); freed > 0 {
+		log.Info("早期写入参数正文已移除，省下 %d 字节（全文在各自文件里）", freed)
+	}
+
 	overhead := EstimateTools(a.registry.Definitions()) + estimateTextTokens(a.config.SystemPrompt)
 	budget := a.config.HistoryBudget() - overhead
 	scale := a.tokenScale()
@@ -666,6 +671,11 @@ func (a *Agent) runOneQuiet(ctx context.Context, block llm.ContentBlock, tool to
 	if execErr != nil {
 		log.Warn("工具 %s 失败: %v", block.Name, execErr)
 		return errorResult(block.ID, a.cache.Govern(block.ID, execErr.Error()))
+	}
+	// 重复读取先省掉：这一份和历史里那一份逐字相同，就没必要再发一遍（也不会落盘）。
+	if notice := a.duplicateNotice(block.Name, block.Input, result); notice != "" {
+		log.Info("工具 %s 的结果与历史里的一份相同，省略 %d 字节", block.Name, len(result))
+		return llm.ContentBlock{Type: "tool_result", ToolUseID: block.ID, Content: notice}
 	}
 	log.Info("工具 %s 完成，返回 %d 字节", block.Name, len(result))
 	return llm.ContentBlock{

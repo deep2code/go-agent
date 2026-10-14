@@ -69,7 +69,7 @@ func renderTranscript(messages []llm.Message) string {
 			case "thinking":
 				// 思考过程不进气泡：留了它反而稀释摘要
 			case "tool_use":
-				fmt.Fprintf(&sb, "%s调用工具 %s，参数 %v\n", who, b.Name, b.Input)
+				fmt.Fprintf(&sb, "%s调用工具 %s，参数 %s\n", who, b.Name, clipArgs(b.Input, maxArgChars))
 			case "tool_result":
 				if t := strings.TrimSpace(toolResultText(b)); t != "" {
 					fmt.Fprintf(&sb, "工具结果: %s\n", clip(t, maxBlockChars))
@@ -77,6 +77,35 @@ func renderTranscript(messages []llm.Message) string {
 			}
 		}
 	}
+	return sb.String()
+}
+
+// maxArgChars 是摘要里单个参数值的上限。
+//
+// 摘要请求本意是"把即将丢掉的东西压成几行"，如果把 write_file 的整份 content 原样
+// 摊进去，摘要调用自己就成了被折叠内容的大小——省下的预算又还回去了。
+const maxArgChars = 200
+
+// clipArgs 把工具参数摊成一行，逐个值截断；键按字母序，保证同样的调用给出同样的文本。
+func clipArgs(input map[string]any, max int) string {
+	if len(input) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(input))
+	for k := range input {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+
+	var sb strings.Builder
+	sb.WriteString("{")
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "%s=%q", k, clip(fmt.Sprintf("%v", input[k]), max))
+	}
+	sb.WriteString("}")
 	return sb.String()
 }
 

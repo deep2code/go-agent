@@ -182,6 +182,45 @@ func TestRenderTranscript(t *testing.T) {
 	}
 }
 
+// 摘要请求本身不该变成被折叠内容的副本：把 write_file 的整份 content 原样摊进去，
+// 刚省下来的预算又被摘要自己吃回去了。
+func TestRenderTranscriptClipsToolArgs(t *testing.T) {
+	body := strings.Repeat("package main\n", 400) // 5600 字节
+	msgs := []llm.Message{{Role: llm.RoleAssistant, Content: []llm.ContentBlock{{
+		Type: "tool_use", ID: "t1", Name: "write_file",
+		Input: map[string]any{"file_path": "a.go", "content": body},
+	}}}}
+
+	out := renderTranscript(msgs)
+	if strings.Contains(out, body) {
+		t.Error("工具参数的整份正文进了摘要请求")
+	}
+	if len([]rune(out)) > 600 {
+		t.Errorf("摘要转写被参数撑到 %d 字", len([]rune(out)))
+	}
+	// 短参数必须原样留着：file_path 是摘要里唯一能点名"改的是哪个文件"的线索
+	if !strings.Contains(out, "a.go") {
+		t.Errorf("短参数被一起截掉了:\n%s", out)
+	}
+}
+
+// 同一份参数每次转写必须一模一样：转写文本进的是模型调用，抖动没有意义还更难核对。
+func TestClipArgsIsStable(t *testing.T) {
+	input := map[string]any{"zeta": "1", "alpha": "2", "mid": "3"}
+	first := clipArgs(input, 20)
+	for i := 0; i < 20; i++ {
+		if clipArgs(input, 20) != first {
+			t.Fatal("同一份参数的转写每次不同")
+		}
+	}
+	if !strings.HasPrefix(first, "{alpha=") {
+		t.Errorf("键未按字母序排列: %q", first)
+	}
+	if got := clipArgs(nil, 20); got != "{}" {
+		t.Errorf("空参数应转成 {}，实际 %q", got)
+	}
+}
+
 func TestClip(t *testing.T) {
 	if got := clip("中文混abc", 2); got != "中文…" {
 		t.Errorf("clip = %q", got)

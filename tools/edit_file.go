@@ -42,6 +42,10 @@ func (t *EditFileTool) Name() string { return "edit_file" }
 // Mutating 报告该工具会改文件。
 func (t *EditFileTool) Mutating() bool { return true }
 
+// BodyParams 只声明 new_string，不声明 old_string：替换成功后新内容就在文件里，
+// read_file 能回读；old_string 已经被替换掉，历史是它唯一的去处，砍了再也找不回。
+func (t *EditFileTool) BodyParams() []string { return []string{"new_string"} }
+
 // Definition 返回 edit_file 工具的 JSON Schema。
 func (t *EditFileTool) Definition() llm.ToolDef {
 	return llm.ToolDef{
