@@ -5,9 +5,10 @@
 //   - 如果 LLM 返回 tool_calls 请求：执行工具，将结果反馈给 LLM，继续循环
 //   - 如果达到最大迭代次数：强制终止
 //
-// 每轮把完整历史发给 LLM 以保留记忆，代价是对话越长越容易撑爆上下文窗口，
-// 因此发送前有两道处理：RepairHistory 修好中断留下的残缺消息，
-// CompactHistory 在接近预算时折叠旧的工具输出、丢弃最早的往返。
+// 每轮把完整历史发给 LLM 以保留记忆，代价是对话越长越容易撑爆上下文窗口。
+// 治理分两处落：工具输出**进历史之前**过一次 L1（超限就切成头 + 指针 + 尾，全文落盘，见 toolcache.go）；
+// 发送前则先 RepairHistory 修好中断留下的残缺消息，再把历史里早期的大输出换成同一形式的指针（L2），
+// 到这一步还是超预算才动用最后一档——CompactHistory 折叠旧的工具输出、丢弃最早的往返。
 package agent
 
 import (
@@ -16,7 +17,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go-agent/llm"
@@ -56,6 +59,16 @@ type Config struct {
 
 	// Quiet 为 true 时不输出任何过程信息，只返回结果（非交互模式用）。
 	Quiet bool
+
+	// MaxCostUSD 是单次会话的累计花费上限（按 EstimateCost 的口径），
+	// 达到后 ReAct 循环以 cost_limit 停止。0 表示不设限。
+	// 模型不在价目表里时无从换算金额，此时上限不生效并会告警一次。
+	MaxCostUSD float64
+
+	// Cache 是大输出的外置缓存（L1/L2 两级治理共用的那一份）。
+	// 为 nil 时 New 按 WorkingDir 就地建一份；父子 agent 传同一个实例，
+	// 否则主对话里生成的指针在子 agent 那边读不到。
+	Cache *ToolCache
 }
 
 // DefaultConfig 返回推荐的默认配置。
@@ -128,6 +141,8 @@ var (
 	ErrInterrupted = errors.New("任务被中断")
 	// ErrMaxIterations 表示达到最大迭代次数仍未收敛。
 	ErrMaxIterations = errors.New("达到最大迭代次数")
+	// ErrCostLimit 表示会话累计花费达到 -max-cost 设定的上限。
+	ErrCostLimit = errors.New("达到花费上限")
 )
 
 // Result 一次任务的结果。
@@ -152,6 +167,19 @@ type Agent struct {
 	registry *tools.Registry
 	history  []llm.Message
 	usage    llm.Usage
+
+	// estScale 是"服务端真实输入 token / 本地估算"的滑动比例，0 表示还没校准过。
+	// 预算判断必须走同一口径，否则启发式估算偏乐观时会在服务端那里撞墙。
+	estScale float64
+
+	// sentEstimate 是上一次真正发出去的载荷估算值，供服务端返回后校准。
+	sentEstimate int
+
+	// cache 是 L1/L2 共用的大输出外置缓存（由 New 填好，一定非 nil）。
+	cache *ToolCache
+
+	// warnedNoPrice 防止无价目表时每轮重复告警。
+	warnedNoPrice bool
 }
 
 // New 创建一个新的智能体实例。
@@ -159,11 +187,18 @@ func New(config Config, provider llm.Provider, registry *tools.Registry) *Agent 
 	if p, ok := provider.(llm.RetrySetter); ok {
 		p.SetRetry(config.Retry)
 	}
+	if config.Cache == nil {
+		// 缺省落在工作目录下的 .go-agent/：那里已经是智能体自己的地盘，
+		// 也被 .gitignore 和搜索的跳过规则覆盖（不会把回灌过的输出当代码搜回来）。
+		config.Cache = NewToolCache(
+			filepath.Join(config.WorkingDir, ".go-agent", "toolcache"), ".go-agent/toolcache")
+	}
 	return &Agent{
 		config:   config,
 		provider: provider,
 		registry: registry,
 		history:  make([]llm.Message, 0),
+		cache:    config.Cache,
 	}
 }
 
@@ -180,11 +215,28 @@ func (a *Agent) SetModel(model string) {
 // HistoryLen 返回当前对话历史的消息数。
 func (a *Agent) HistoryLen() int { return len(a.history) }
 
+// ToolNames 返回该 agent 可用的工具名。
+// 用于在上层校验子 agent 的工具面（子 agent 必须只读）。
+func (a *Agent) ToolNames() []string { return a.registry.Names() }
+
+// SystemPrompt 返回当前生效的系统提示词。
+// 用于校验子 agent 拿到的是只读提示词，而不是主 agent 那份。
+func (a *Agent) SystemPrompt() string { return a.config.SystemPrompt }
+
 // History 返回对话历史的副本，用于落盘或恢复。
 func (a *Agent) History() []llm.Message { return cloneMessages(a.history) }
 
 // Usage 返回累计 token 用量。
 func (a *Agent) Usage() llm.Usage { return a.usage }
+
+// AddUsage 把另一次运行（如子 agent）的用量累加进来，
+// 这样主对话的花费统计能覆盖子任务烧掉的 token。
+func (a *Agent) AddUsage(u llm.Usage) {
+	a.usage.InputTokens += u.InputTokens
+	a.usage.OutputTokens += u.OutputTokens
+	a.usage.CacheCreationInputTokens += u.CacheCreationInputTokens
+	a.usage.CacheReadInputTokens += u.CacheReadInputTokens
+}
 
 // LoadHistory 用已有历史替换当前历史（恢复会话）。
 func (a *Agent) LoadHistory(messages []llm.Message) {
@@ -225,7 +277,7 @@ func (a *Agent) Run(ctx context.Context, userTask string) (*Result, error) {
 			return res, fmt.Errorf("%w: %v", ErrInterrupted, err)
 		}
 
-		roundUsage, err := a.prepareForSend()
+		roundUsage, err := a.prepareForSend(ctx)
 		if err != nil {
 			log.Error("上下文准备失败: %v", err)
 			res.StopReason = "error"
@@ -235,8 +287,18 @@ func (a *Agent) Run(ctx context.Context, userTask string) (*Result, error) {
 			res.Compactions++
 		}
 
-		log.Info("ReAct 第 %d/%d 轮：历史 %d 条消息，估算 %d token",
-			iteration, a.config.MaxIterations, len(a.history), roundUsage)
+		if err := a.checkCostLimit(); err != nil {
+			res.Usage = a.usage
+			res.Iterations = iteration - 1
+			res.CostUSD = EstimateCost(a.config.Model, a.usage)
+			res.Elapsed = time.Since(start)
+			res.StopReason = "cost_limit"
+			log.Warn("%v", err)
+			return res, err
+		}
+
+		log.Info("ReAct 第 %d/%d 轮：历史 %d 条消息，估算 %d token（校准 %s）",
+			iteration, a.config.MaxIterations, len(a.history), a.sentEstimate, a.calibrationLabel())
 
 		fmt.Fprintf(out, "\n🤖 ")
 		resp, err := a.call(ctx, iteration)
@@ -253,6 +315,9 @@ func (a *Agent) Run(ctx context.Context, userTask string) (*Result, error) {
 
 		a.usage.InputTokens += resp.Usage.InputTokens
 		a.usage.OutputTokens += resp.Usage.OutputTokens
+		a.usage.CacheCreationInputTokens += resp.Usage.CacheCreationInputTokens
+		a.usage.CacheReadInputTokens += resp.Usage.CacheReadInputTokens
+		a.calibrate(resp.Usage.PromptTokens())
 		res.Usage = a.usage
 		res.Iterations = iteration
 
@@ -322,9 +387,7 @@ func (a *Agent) call(ctx context.Context, round int) (*llm.ChatResponse, error) 
 
 	// 估算偏乐观时仍可能撞墙：这里按服务端反馈再压一次
 	log.Warn("服务端判定上下文超限，折叠历史后重试一次")
-	budget := a.config.HistoryBudget() / 2
-	compacted, _ := CompactHistory(a.history, budget)
-	a.history = compacted
+	a.compact(ctx, a.config.HistoryBudget()/2)
 
 	retry, err2 := a.provider.StreamingChat(ctx, a.request(round), func(text string) {
 		fmt.Fprint(out, text)
@@ -348,7 +411,10 @@ func (a *Agent) request(round int) llm.ChatRequest {
 }
 
 // prepareForSend 修复历史并压到预算内，返回折叠省下的 token 数（0 表示未折叠）。
-func (a *Agent) prepareForSend() (int, error) {
+//
+// 预算是服务端的 token 口径，而 EstimateTokens 是本地启发式估算，两者有系统性偏差
+// （尤其中英混排）。所以拿校准比例换算过再比较，不能直接拿估算值顶。
+func (a *Agent) prepareForSend(ctx context.Context) (int, error) {
 	repaired := RepairHistory(a.history)
 	if len(repaired) == 0 {
 		a.history = repaired
@@ -356,74 +422,281 @@ func (a *Agent) prepareForSend() (int, error) {
 	}
 	a.history = repaired
 
+	// L2 在估算之前：先给早期的大输出换成指针，再决定要不要动用折叠。
+	// 顺序很要紧——放在估算之后等于这一级永远轮不到发言，
+	// 因为超预算的判断已经按换指针之前的体积做完了。
+	if freed := a.Pointerize(a.history); freed > 0 {
+		log.Info("早期工具输出已换成指针，省下 %d 字节（完整内容仍在 .go-agent/toolcache 里可回读）", freed)
+	}
+
 	overhead := EstimateTools(a.registry.Definitions()) + estimateTextTokens(a.config.SystemPrompt)
 	budget := a.config.HistoryBudget() - overhead
-	if used := EstimateTokens(a.history); used <= budget {
-		return 0, nil
+	scale := a.tokenScale()
+
+	// 把本地估算换算到服务端口径后再判断是否超预算。
+	used := int(float64(EstimateTokens(a.history)) * scale)
+	freed := 0
+	if used > budget {
+		// CompactHistory 按本地估算工作，所以预算要折算回本地口径。
+		localBudget := int(float64(budget) / scale)
+		freed = a.compact(ctx, localBudget)
+		log.Warn("上下文接近预算（真实口径 %d/%d，估算已按 %.2f 校准），已折叠历史省下约 %d token",
+			used, budget, scale, freed)
 	}
-	compacted, freed := CompactHistory(a.history, budget)
-	a.history = compacted
-	log.Warn("上下文接近预算（预算 %d），已折叠历史省下约 %d token", budget, freed)
+
+	a.sentEstimate = EstimateTokens(a.history) + overhead
 	return freed, nil
+}
+
+// tokenScale 返回当前"服务端真实 token / 本地估算"的换算比例，未校准时为 1。
+func (a *Agent) tokenScale() float64 {
+	if a.estScale == 0 {
+		return 1
+	}
+	return a.estScale
+}
+
+// calibrate 用服务端返回的真实输入 token 校正本地估算。
+//
+// 比例限幅在 [0.4, 3]：单轮的异常值（比如折叠后历史骤减）不该把系数带到离谱的位置；
+// 取中点平滑一次，让系数随对话推进逐步收敛。
+func (a *Agent) calibrate(actual int) {
+	if actual <= 0 || a.sentEstimate <= 0 {
+		return
+	}
+	ratio := float64(actual) / float64(a.sentEstimate)
+	if ratio < 0.4 {
+		ratio = 0.4
+	}
+	if ratio > 3 {
+		ratio = 3
+	}
+	before := a.estScale
+	if a.estScale == 0 {
+		a.estScale = ratio
+	} else {
+		a.estScale = (a.estScale + ratio) / 2
+	}
+	log.Debug("token 估算校准：服务端 %d / 本地估算 %d → 系数 %.2f（原 %.2f）",
+		actual, a.sentEstimate, a.estScale, before)
+}
+
+// calibrationLabel 给日志用的一句校准状态。
+func (a *Agent) calibrationLabel() string {
+	if a.estScale == 0 {
+		return "未校准"
+	}
+	return fmt.Sprintf("%.2f", a.estScale)
+}
+
+// checkCostLimit 在发起下一次调用之前核对累计花费。
+//
+// 上限拦不住已经烧掉的那一次，但能在下一轮停下来——一轮的代价远小于放任整个循环。
+func (a *Agent) checkCostLimit() error {
+	limit := a.config.MaxCostUSD
+	if limit <= 0 {
+		return nil
+	}
+	spent := EstimateCost(a.config.Model, a.usage)
+	if spent == 0 {
+		if a.usage.Total() > 0 && !a.warnedNoPrice {
+			a.warnedNoPrice = true
+			log.Warn("模型 %s 不在内置价目表里，无法换算花费：-max-cost 上限不会生效", a.config.Model)
+		}
+		return nil
+	}
+	if spent < limit {
+		return nil
+	}
+	return fmt.Errorf("%w：本次会话已花约 $%.4f，上限 $%.4f；可用 /cost 核对，或提高上限后重试",
+		ErrCostLimit, spent, limit)
+}
+
+// compact 折叠历史到 budget 以内，并重新修复一遍。
+//
+// 折叠会改变消息序列（丢弃往返、插入摘要），结果可能不再满足角色交替；
+// 之前直接发出去会撞上服务端的格式校验。折叠后必须再过一次 RepairHistory。
+func (a *Agent) compact(ctx context.Context, budget int) int {
+	compacted, freed := CompactHistory(ctx, a.history, budget, a.newSummarizer())
+	a.history = RepairHistory(compacted)
+	return freed
 }
 
 // ============================================================================
 // 工具执行
 // ============================================================================
 
+// maxParallelTools 一组只读调用最多同时跑几个。
+//
+// 不放开是因为大仓库里一趟可能十几个 read_file，全开会把磁盘和 CPU 打满；
+// 4 个已经把"排队等 IO"的时间吃掉大半。
+const maxParallelTools = 4
+
 // executeToolCalls 执行 assistant 消息中的所有 tool_use 块，
 // 返回与之配对的 tool_result 块。
 //
 // 单个工具失败不作为整体失败：错误信息带 is_error 回给模型，由它决定换思路。
 // 只有用户中断才会提前返回，此时未执行到的调用交给 RepairHistory 补占位结果。
+//
+// 彼此独立的只读调用会并发跑（见 tools.Parallelizable），但结果**严格按模型给出的顺序回填**：
+// tool_result 的先后是历史的一部分，乱序会让下一轮请求里配对关系看起来对不上。
 func (a *Agent) executeToolCalls(ctx context.Context, content []llm.ContentBlock, out io.Writer) ([]llm.ContentBlock, error) {
-	results := make([]llm.ContentBlock, 0, len(content))
+	// 槽位与 content 下标一一对应；nil 表示这一格没执行（非 tool_use、被截断、或中断未跑）
+	slots := make([]*llm.ContentBlock, len(content))
+	err := a.runBlocks(ctx, content, slots, out)
+	return flattenSlots(slots), err
+}
 
-	for _, block := range content {
-		if block.Type != "tool_use" {
+// runBlocks 按原序遍历调用，能并发的连续段攒成一组并发跑，其余逐个串行。
+// slots 按 content 下标回填。返回 ErrInterrupted 时，未跑到的格子留空。
+func (a *Agent) runBlocks(ctx context.Context, content []llm.ContentBlock, slots []*llm.ContentBlock, out io.Writer) error {
+	i := 0
+	for i < len(content) {
+		block := content[i]
+		if block.Type != "tool_use" || block.Partial {
+			i++
 			continue
-		}
-		if block.Partial {
-			continue // 参数被截断，不能执行
 		}
 
 		select {
 		case <-ctx.Done():
-			return results, fmt.Errorf("%w: %v", ErrInterrupted, ctx.Err())
+			return fmt.Errorf("%w: %v", ErrInterrupted, ctx.Err())
 		default:
 		}
-
-		previewArgs := summarizeArgs(block.Input)
-		log.Info("执行工具 %s(%s)", block.Name, previewArgs)
-		fmt.Fprintf(out, "  🔧 %s %s\n", block.Name, previewArgs)
 
 		tool, ok := a.registry.Get(block.Name)
 		if !ok {
 			log.Warn("未知工具: %s", block.Name)
-			results = append(results, errorResult(block.ID,
+			slots[i] = ptrTo(errorResult(block.ID,
 				fmt.Sprintf("未知工具: %s。可用工具: %s", block.Name, strings.Join(a.registry.Names(), ", "))))
+			i++
 			continue
 		}
 
-		result, execErr := tool.Execute(ctx, block.Input)
-		if execErr != nil {
-			log.Warn("工具 %s 失败: %v", block.Name, execErr)
-			fmt.Fprintf(out, "  ❌ %v\n", execErr)
-			results = append(results, errorResult(block.ID, execErr.Error()))
+		if !tools.Parallelizable(tool) {
+			a.preview(block, out)
+			slots[i] = ptrTo(a.runOne(ctx, block, tool, out))
+			i++
 			continue
 		}
 
-		log.Info("工具 %s 完成，返回 %d 字节", block.Name, len(result))
-		fmt.Fprint(out, indent(result))
-		results = append(results, llm.ContentBlock{
-			Type:      "tool_result",
-			ToolUseID: block.ID,
-			Content:   result,
-		})
+		// 攒出连续的、都可并行的这一段
+		end := i + 1
+		for end < len(content) && a.parallelCandidate(content[end]) {
+			end++
+		}
+		// 回显按原序打完再并发跑：谁先完成是不确定的，终端上的顺序必须确定
+		for k := i; k < end; k++ {
+			a.preview(content[k], out)
+		}
+		a.runParallel(ctx, content[i:end], slots[i:end], out)
+		// 组里被中断的格子留空，交给外层循环在下一次 ctx 检查时收尾
+		i = end
 	}
 
-	return results, nil
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("%w: %v", ErrInterrupted, ctx.Err())
+	default:
+	}
+	return nil
 }
+
+// parallelCandidate 判断这一格能不能进并发组（与 runBlocks 里的分组条件保持一致）。
+func (a *Agent) parallelCandidate(block llm.ContentBlock) bool {
+	if block.Type != "tool_use" || block.Partial {
+		return false
+	}
+	tool, ok := a.registry.Get(block.Name)
+	return ok && tools.Parallelizable(tool)
+}
+
+// preview 打一行"要调用什么"，在真正执行之前。
+func (a *Agent) preview(block llm.ContentBlock, out io.Writer) {
+	previewArgs := summarizeArgs(block.Input)
+	log.Info("执行工具 %s(%s)", block.Name, previewArgs)
+	fmt.Fprintf(out, "  🔧 %s %s\n", block.Name, previewArgs)
+}
+
+// runParallel 并发执行一组只读调用，结果按传入顺序写回 slots。
+func (a *Agent) runParallel(ctx context.Context, blocks []llm.ContentBlock, slots []*llm.ContentBlock, out io.Writer) {
+	sem := make(chan struct{}, maxParallelTools)
+	var wg sync.WaitGroup
+	for k := range blocks {
+		select {
+		case <-ctx.Done():
+			// 剩下的不启动：留空格子由 RepairHistory 补占位结果
+			continue
+		default:
+		}
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			tool, _ := a.registry.Get(blocks[k].Name)
+			slots[k] = ptrTo(a.runOneQuiet(ctx, blocks[k], tool))
+		}(k)
+	}
+	wg.Wait()
+
+	// 结果按原序落终端，而不是按谁先跑完
+	for k, block := range blocks {
+		if slots[k] == nil {
+			continue
+		}
+		a.echoResult(block, *slots[k], out)
+	}
+}
+
+// runOne 执行一个调用并把过程回显出来（串行路径用）。
+func (a *Agent) runOne(ctx context.Context, block llm.ContentBlock, tool tools.Tool, out io.Writer) llm.ContentBlock {
+	res := a.runOneQuiet(ctx, block, tool)
+	a.echoResult(block, res, out)
+	return res
+}
+
+// runOneQuiet 只执行、不打印：并发时两个 goroutine 同时往终端写会互相插字。
+//
+// 工具返回后立刻过 L1 治理（见 agent/toolcache.go）：这里正是"外部文本进历史"的那道门，
+// 守卫已经在工具内部跑过，所以落盘的全文是隐去密钥之后的版本。
+func (a *Agent) runOneQuiet(ctx context.Context, block llm.ContentBlock, tool tools.Tool) llm.ContentBlock {
+	result, execErr := tool.Execute(ctx, block.Input)
+	if execErr != nil {
+		log.Warn("工具 %s 失败: %v", block.Name, execErr)
+		return errorResult(block.ID, a.cache.Govern(block.ID, execErr.Error()))
+	}
+	log.Info("工具 %s 完成，返回 %d 字节", block.Name, len(result))
+	return llm.ContentBlock{
+		Type:      "tool_result",
+		ToolUseID: block.ID,
+		Content:   a.cache.Govern(block.ID, result),
+	}
+}
+
+// echoResult 把一次执行的结果打到终端，顺序由调用方决定。
+func (a *Agent) echoResult(block llm.ContentBlock, res llm.ContentBlock, out io.Writer) {
+	text, _ := res.Content.(string)
+	if res.IsError != nil && *res.IsError {
+		fmt.Fprintf(out, "  ❌ %s\n", text)
+		return
+	}
+	fmt.Fprint(out, indent(text))
+}
+
+// flattenSlots 按原顺序收集已执行的结果，跳过没执行到的格子。
+func flattenSlots(slots []*llm.ContentBlock) []llm.ContentBlock {
+	out := make([]llm.ContentBlock, 0, len(slots))
+	for _, s := range slots {
+		if s != nil {
+			out = append(out, *s)
+		}
+	}
+	return out
+}
+
+func ptrTo(b llm.ContentBlock) *llm.ContentBlock { return &b }
 
 // errorResult 构造一条 is_error 的工具结果。
 func errorResult(id, msg string) llm.ContentBlock {

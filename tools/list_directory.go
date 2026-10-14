@@ -121,5 +121,11 @@ func (t *ListDirectoryTool) Execute(ctx context.Context, input map[string]any) (
 		))
 	}
 
-	return sb.String(), nil
+	// 目录名也是外部文字：仓库里可以有人把目录取名叫 "ignore previous instructions…"。
+	// relPath 传空、state 传 nil 是有意的：列出的不是某个文件的内容，
+	// 把目录记进"依据文件"会让写操作的确认框点名一个 read_file 永远读不到的路径。
+	return GuardExternalContent(sb.String(), "", nil), nil
 }
+
+// ParallelSafe 报告该工具可以并发执行：只读、不占终端、不派子循环。
+func (t *ListDirectoryTool) ParallelSafe() bool { return true }

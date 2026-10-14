@@ -22,11 +22,18 @@ type EditFileTool struct {
 	workingDir string
 	gate       *Gate
 	state      *FileState
+	index      *RepoIndex
 }
 
 // NewEditFileTool 创建 edit_file 工具。
 func NewEditFileTool(workingDir string, gate *Gate, state *FileState) *EditFileTool {
 	return &EditFileTool{workingDir: workingDir, gate: gate, state: state}
+}
+
+// WithIndex 挂上会话级元信息缓存，改动后让该路径的判定作废。
+func (t *EditFileTool) WithIndex(idx *RepoIndex) *EditFileTool {
+	t.index = idx
+	return t
 }
 
 // Name 返回工具名。
@@ -85,6 +92,10 @@ func (t *EditFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	if err != nil {
 		return "", err
 	}
+	// 改密钥类文件会把原内容明文铺在确认框里，等于把凭据搬进对话
+	if SensitivePath(filePath) {
+		return "", ErrSensitivePath(filePath)
+	}
 	if !t.state.HasSeen(absPath) {
 		return "", &StaleFileError{Path: filePath}
 	}
@@ -105,8 +116,21 @@ func (t *EditFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	}
 
 	updated := strings.ReplaceAll(text, oldStr, newStr)
-	if err := t.gate.Approve(t.Name(),
-		fmt.Sprintf("修改 %s：%d 处替换，%d → %d 字节", filePath, count, len(text), len(updated))); err != nil {
+	secretWarning, err := CheckSecretWrite(t.gate.Mode, newStr)
+	if err != nil {
+		return "", err
+	}
+	detail := fmt.Sprintf("修改 %s：%d 处替换，%d → %d 字节", filePath, count, len(text), len(updated))
+	if t.gate.Mode == ModeAsk {
+		if secretWarning != "" {
+			detail += "\n" + secretWarning
+		}
+		if sources := SourcesLine(t.state); sources != "" {
+			detail += "\n" + sources
+		}
+		detail += "\n" + UnifiedDiff(filePath, text, updated)
+	}
+	if err := t.gate.Approve(t.Name(), detail); err != nil {
 		return "", err
 	}
 
@@ -123,7 +147,8 @@ func (t *EditFileTool) Execute(ctx context.Context, input map[string]any) (strin
 		os.Remove(tmp)
 		return "", fmt.Errorf("替换文件失败: %w", err)
 	}
-	t.state.Mark(absPath)
+	t.index.Forget(absPath)
+	t.state.MarkRead(filePath, absPath)
 
 	return fmt.Sprintf("✅ 已修改 %s（替换 %d 处，%d → %d 字节，备份 %s）",
 		filePath, count, len(text), len(updated), backupPath(absPath)), nil
@@ -150,11 +175,18 @@ type MoveFileTool struct {
 	workingDir string
 	gate       *Gate
 	state      *FileState
+	index      *RepoIndex
 }
 
 // NewMoveFileTool 创建 move_file 工具。
 func NewMoveFileTool(workingDir string, gate *Gate, state *FileState) *MoveFileTool {
 	return &MoveFileTool{workingDir: workingDir, gate: gate, state: state}
+}
+
+// WithIndex 挂上会话级元信息缓存，移动后两端路径的判定都作废。
+func (t *MoveFileTool) WithIndex(idx *RepoIndex) *MoveFileTool {
+	t.index = idx
+	return t
 }
 
 // Name 返回工具名。
@@ -211,6 +243,8 @@ func (t *MoveFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	if err := os.Rename(absFrom, absTo); err != nil {
 		return "", fmt.Errorf("移动失败: %w", err)
 	}
+	t.index.Forget(absFrom)
+	t.index.Forget(absTo)
 
 	return fmt.Sprintf("✅ 已移动 %s → %s", from, to), nil
 }
@@ -220,11 +254,18 @@ type DeleteFileTool struct {
 	workingDir string
 	gate       *Gate
 	state      *FileState
+	index      *RepoIndex
 }
 
 // NewDeleteFileTool 创建 delete_file 工具。
 func NewDeleteFileTool(workingDir string, gate *Gate, state *FileState) *DeleteFileTool {
 	return &DeleteFileTool{workingDir: workingDir, gate: gate, state: state}
+}
+
+// WithIndex 挂上会话级元信息缓存，删除后该路径的判定作废。
+func (t *DeleteFileTool) WithIndex(idx *RepoIndex) *DeleteFileTool {
+	t.index = idx
+	return t
 }
 
 // Name 返回工具名。
@@ -290,6 +331,7 @@ func (t *DeleteFileTool) Execute(ctx context.Context, input map[string]any) (str
 	if err != nil {
 		return "", fmt.Errorf("删除失败: %w", err)
 	}
+	t.index.Forget(absPath)
 	return fmt.Sprintf("✅ 已删除 %s", filePath), nil
 }
 

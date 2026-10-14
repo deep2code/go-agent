@@ -421,8 +421,9 @@ func TestAnthropicStreamingChatOverHTTP(t *testing.T) {
 		t.Errorf("用量 = %+v", resp.Usage)
 	}
 
-	if !strings.Contains(body, `"system":"规则"`) {
-		t.Errorf("system 未传递: %s", body)
+	// system 走块数组而不是裸字符串：只有数组形式能带 cache_control 断点。
+	if !strings.Contains(body, `"system":[{"type":"text","text":"规则"}]`) {
+		t.Errorf("system 未按块数组下发: %s", body)
 	}
 	if !strings.Contains(body, `"max_tokens":512`) || !strings.Contains(body, `"stream":true`) {
 		t.Errorf("请求体缺字段: %s", body)

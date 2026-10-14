@@ -34,13 +34,21 @@ var prices = []struct {
 	{"glm", price{0.60, 2.20}},
 }
 
+const (
+	cacheReadFactor  = 0.10 // 命中缓存的输入按 1/10 计价
+	cacheWriteFactor = 1.25 // 写缓存的输入按 1.25 倍计价（5 分钟 TTL）
+)
+
 // EstimateCost 估算 token 用量的美元成本；模型不在价目表里时返回 0。
 func EstimateCost(model string, usage llm.Usage) float64 {
 	lower := strings.ToLower(model)
 	for _, e := range prices {
 		if strings.Contains(lower, e.match) {
-			return float64(usage.InputTokens)/1e6*e.cost.input +
-				float64(usage.OutputTokens)/1e6*e.cost.output
+			// 缓存段的三段输入各自计价，混在一起算会同时抹掉省的钱和溢价。
+			inputUSD := (float64(usage.InputTokens) +
+				float64(usage.CacheCreationInputTokens)*cacheWriteFactor +
+				float64(usage.CacheReadInputTokens)*cacheReadFactor) * e.cost.input / 1e6
+			return inputUSD + float64(usage.OutputTokens)/1e6*e.cost.output
 		}
 	}
 	return 0

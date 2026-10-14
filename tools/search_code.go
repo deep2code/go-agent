@@ -19,11 +19,19 @@ import (
 // SearchCodeTool 在目录树中使用正则表达式搜索文件内容。
 type SearchCodeTool struct {
 	workingDir string
+	index      *RepoIndex
 }
 
 // NewSearchCodeTool 创建 search_code 工具。
 func NewSearchCodeTool(workingDir string) *SearchCodeTool {
 	return &SearchCodeTool{workingDir: workingDir}
+}
+
+// WithIndex 挂上会话级元信息缓存。不挂也能跑，只是每趟搜索都重新判定一遍
+// 哪些文件是二进制——大仓库里这一项就是每趟几千次 open+read。
+func (t *SearchCodeTool) WithIndex(idx *RepoIndex) *SearchCodeTool {
+	t.index = idx
+	return t
 }
 
 // Name 返回工具名。
@@ -36,7 +44,7 @@ func (t *SearchCodeTool) Mutating() bool { return false }
 func (t *SearchCodeTool) Definition() llm.ToolDef {
 	return llm.ToolDef{
 		Name:        "search_code",
-		Description: "在目录树中使用正则表达式搜索文件内容（类似 grep）。自动忽略 .git 目录和二进制文件。默认最多返回 500 条匹配。",
+		Description: "在目录树中使用正则表达式搜索文件内容（类似 grep）。自动忽略 .git 目录、二进制文件和密钥类文件（.env、*.pem、.ssh/ 等）。默认最多返回 500 条匹配。",
 		InputSchema: llm.InputSchema{
 			Type: "object",
 			Properties: map[string]llm.Property{
@@ -100,6 +108,7 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 
 	var matches []match
 	totalScanned := 0
+	skippedSensitive := 0
 
 	walkErr := filepath.WalkDir(absSearchDir, func(path string, d fs.DirEntry, err error) error {
 		// 检查上下文取消
@@ -113,10 +122,9 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 			return nil // 跳过无法访问的文件/目录
 		}
 
-		// 跳过 .git 等版本控制目录
+		// 跳过 .git、vendor、node_modules，以及智能体自己落盘的 .go-agent
 		if d.IsDir() {
-			base := d.Name()
-			if base == ".git" || base == ".svn" || base == "vendor" || base == "node_modules" {
+			if isIgnoredDir(d.Name()) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -130,13 +138,29 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 			}
 		}
 
-		// 跳过二进制文件（快速检查：前 512 字节中有无 null 字节）
-		if isBinary(path) {
+		info, err := d.Info()
+		if err != nil {
 			return nil
 		}
 
 		// 跳过超大文件，避免为了搜索把内存吃满
-		if info, err := d.Info(); err == nil && info.Size() > maxSearchFileBytes {
+		if info.Size() > maxSearchFileBytes {
+			return nil
+		}
+
+		// 跳过二进制文件（快速检查：前 512 字节中有无 null 字节）
+		if !t.index.IsTextFile(path, info) {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(absWorkingDir, path)
+		if err != nil {
+			relPath = path
+		}
+
+		// 密钥类文件不参与搜索：grep 到一行就等于把凭据的一个片段搬进对话
+		if SensitivePath(relPath) {
+			skippedSensitive++
 			return nil
 		}
 
@@ -148,10 +172,6 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 			return nil
 		}
 
-		relPath, err := filepath.Rel(absWorkingDir, path)
-		if err != nil {
-			relPath = path
-		}
 		lines := strings.Split(string(data), "\n")
 		for lineNo, line := range lines {
 			if re.MatchString(line) {
@@ -180,6 +200,9 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 
 	if len(matches) == 0 {
 		sb.WriteString("  (未找到匹配项)\n")
+		if skippedSensitive > 0 {
+			sb.WriteString(fmt.Sprintf("\n  （另有 %d 个密钥类文件未参与搜索，本工具不读取凭据）\n", skippedSensitive))
+		}
 		return sb.String(), nil
 	}
 
@@ -197,8 +220,12 @@ func (t *SearchCodeTool) Execute(ctx context.Context, input map[string]any) (str
 		sb.WriteString(" (结果被截断，已达到 500 条上限)")
 	}
 	sb.WriteString("\n")
+	if skippedSensitive > 0 {
+		sb.WriteString(fmt.Sprintf("\n  （另有 %d 个密钥类文件未参与搜索，本工具不读取凭据）\n", skippedSensitive))
+	}
 
-	return sb.String(), nil
+	// 匹配到的行是别人写下的文字，同样可能是伪装成指令的剧本
+	return GuardExternalContent(sb.String(), "", nil), nil
 }
 
 // isBinary 通过检查文件是否包含 null 字节判断是否为二进制文件。
@@ -221,3 +248,6 @@ func isBinary(path string) bool {
 
 // maxSearchFileBytes 单个文件参与内容搜索的大小上限。
 const maxSearchFileBytes = 2 * 1024 * 1024
+
+// ParallelSafe 报告该工具可以并发执行：只读、不占终端、不派子循环。
+func (t *SearchCodeTool) ParallelSafe() bool { return true }

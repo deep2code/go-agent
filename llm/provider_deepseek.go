@@ -196,9 +196,10 @@ type openAIToolDef struct {
 }
 
 type openAIFunctionDef struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	Parameters  InputSchema `json:"parameters"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Parameters 是 InputSchema，或外部来源（MCP）原样透传的 RawSchema。
+	Parameters any `json:"parameters"`
 }
 
 type openAIErrorResponse struct {
@@ -231,12 +232,17 @@ func (p *DeepSeekProvider) toOpenAIRequest(req ChatRequest) openAIChatRequest {
 	}
 
 	for _, tool := range req.Tools {
+		// 外部来源的 schema 原样透传，内部工具的走结构体
+		var params any = tool.InputSchema
+		if len(tool.RawSchema) > 0 {
+			params = tool.RawSchema
+		}
 		oaReq.Tools = append(oaReq.Tools, openAIToolDef{
 			Type: "function",
 			Function: openAIFunctionDef{
 				Name:        tool.Name,
 				Description: tool.Description,
-				Parameters:  tool.InputSchema,
+				Parameters:  params,
 			},
 		})
 	}

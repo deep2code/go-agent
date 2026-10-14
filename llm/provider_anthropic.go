@@ -78,14 +78,7 @@ func (p *AnthropicProvider) StreamingChat(
 	req ChatRequest,
 	onText func(text string),
 ) (*ChatResponse, error) {
-	body, err := json.Marshal(MessageRequest{
-		Model:     req.Model,
-		MaxTokens: req.MaxTokens,
-		System:    req.System,
-		Messages:  req.Messages,
-		Tools:     req.Tools,
-		Stream:    true,
-	})
+	body, err := json.Marshal(buildAnthropicRequest(req))
 	if err != nil {
 		return nil, fmt.Errorf("序列化请求失败: %w", err)
 	}
@@ -162,6 +155,57 @@ func (p *AnthropicProvider) logError(round int, elapsed time.Duration, msg strin
 	if p.httpLogger != nil && p.httpLogger.Enabled() {
 		p.httpLogger.LogError("anthropic", round, elapsed, msg, body)
 	}
+}
+
+// minCachePrefixChars 是值得一打缓存断点的最短请求前缀。
+//
+// 服务端只缓存达到长度门槛的前缀（Sonnet/Opus 约 1024 token 起，按英文量级
+// 折算成字符），而缓存写入按 1.25 倍计价。前缀不够长时断点换不来任何命中，
+// 等于白付溢价——摘要那种一次性短请求就是这种情形。
+const minCachePrefixChars = 4000
+
+// buildAnthropicRequest 把通用请求转成 Messages API 的 wire 格式。
+func buildAnthropicRequest(req ChatRequest) MessageRequest {
+	wire := MessageRequest{
+		Model:     req.Model,
+		MaxTokens: req.MaxTokens,
+		Messages:  req.Messages,
+		Tools:     req.Tools,
+		Stream:    true,
+	}
+	if req.System != "" {
+		wire.System = []SystemBlock{{Type: "text", Text: req.System}}
+	}
+	if prefixChars(wire) < minCachePrefixChars {
+		return wire
+	}
+
+	// 断点只打一个，放在前缀的最后一项上：它把 system + tools 整段一起缓存。
+	// 打两个断点会让 system 被写两遍，多付一次 1.25 倍。
+	if n := len(wire.Tools); n > 0 {
+		// 复制一份再改：调用方传进来的 Tools 还被上层用于估算和后续轮次，
+		// 就地写入会让 cache_control 泄漏到不该带的请求里。
+		tools := make([]ToolDef, n)
+		copy(tools, req.Tools)
+		tools[n-1].CacheControl = ephemeralCache()
+		wire.Tools = tools
+	} else if n := len(wire.System); n > 0 {
+		wire.System[n-1].CacheControl = ephemeralCache()
+	}
+	return wire
+}
+
+// prefixChars 估算请求前缀（system + tools）的规模。
+func prefixChars(req MessageRequest) int {
+	total := 0
+	for _, b := range req.System {
+		total += len(b.Text)
+	}
+	tools, err := json.Marshal(req.Tools)
+	if err == nil {
+		total += len(tools)
+	}
+	return total
 }
 
 // ============================================================================
@@ -286,7 +330,9 @@ func (p *anthropicSSEParser) handleAnthropicEvent(eventType string, dataLines []
 			p.model = event.Message.Model
 		}
 		if event.Usage != nil {
-			p.usage.InputTokens = event.Usage.InputTokens
+			// 缓存段（cache_creation / cache_read）只出现在 message_start，
+			// 逐字段拷贝会把它们丢掉，剩下的 InputTokens 就成了偏小的假数。
+			p.usage = *event.Usage
 		}
 
 	case "content_block_start":

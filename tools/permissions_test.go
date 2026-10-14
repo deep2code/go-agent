@@ -4,7 +4,9 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestClassifyCommandForbidden(t *testing.T) {
@@ -163,5 +165,51 @@ func TestDescribeWrite(t *testing.T) {
 	}
 	if got := DescribeWrite("a.go", 12, true); got != "覆盖文件 a.go（12 字节）" {
 		t.Errorf("覆盖摘要: %q", got)
+	}
+}
+
+// 父子共用一道门之后，两次确认可能同时找上门。交错打印会让用户看到半句问题就输入了 y，
+// 那道门也就退化成了抽签。这里不测"锁存在"，测"一次只有一处在问话"。
+func TestGateAsksOneAtATime(t *testing.T) {
+	const n = 8
+	var mu sync.Mutex
+	inFlight, peak, answered := 0, 0, 0
+
+	g := NewGate(ModeAsk)
+	g.Out = io.Discard
+	g.Ask = func(_, _ string) bool {
+		mu.Lock()
+		inFlight++
+		if inFlight > peak {
+			peak = inFlight
+		}
+		mu.Unlock()
+
+		time.Sleep(5 * time.Millisecond) // 留出交错的窗口
+
+		mu.Lock()
+		inFlight--
+		answered++
+		mu.Unlock()
+		return true
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := g.Approve("write_file", "并发的确认"); err != nil {
+				t.Errorf("并发确认被拒绝: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if peak != 1 {
+		t.Errorf("同时有 %d 处在向用户问话，期望恰好 1 道门串行", peak)
+	}
+	if answered != n {
+		t.Errorf("问了 %d 次，期望 %d 次：一次都没丢", answered, n)
 	}
 }

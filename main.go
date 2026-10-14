@@ -5,6 +5,9 @@
 //	交互：            go-agent                     进入 REPL，写操作逐个确认
 //	非交互：          go-agent -p "任务" --yes      跑完输出结果，适合脚本与 CI
 //
+// 外部工具：在 .go-agent/mcp.json 里声明 MCP 服务器，启动时拉起并导入它的工具。
+// 这些工具和本地工具走同一套审批门与内容守卫，子智能体拿不到它们。
+//
 // 环境变量:
 //
 //	LLM_PROVIDER       deepseek(默认) / anthropic / openai 兼容端点
@@ -14,6 +17,7 @@
 //	LLM_BASE_URL       OpenAI 兼容端点地址（配合 LLM_PROVIDER=openai）
 //	LOG_LEVEL          debug / info(默认) / warn / error
 //	LLM_LOG_DIR        HTTP 日志目录，默认 ./logs
+//	GO_AGENT_MCP_CONFIG 外部工具配置，默认 .go-agent/mcp.json
 package main
 
 import (
@@ -26,6 +30,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +39,7 @@ import (
 	"go-agent/agent"
 	"go-agent/llm"
 	"go-agent/log"
+	"go-agent/mcp"
 	"go-agent/tools"
 )
 
@@ -49,9 +55,19 @@ type app struct {
 	agent    *agent.Agent
 	plan     *tools.PlanTool
 
+	// 会话级文件元信息缓存：主 agent 和子 agent 共用一份。
+	// 各拿一份的话，子 agent 搜过的文件主 agent 还得重新判定一遍。
+	index *tools.RepoIndex
+
 	out  io.Writer
 	in   *bufio.Reader
 	json bool // 只把结果以 JSON 打到 stdout
+
+	// 已拉起的 MCP 服务器子进程。退出时必须关掉，否则每次用完 CLI 都留下几个孤儿。
+	// 收尾可能来自主流程 defer 和信号处理协程两边，用独立的锁保护，
+	// 不要拿 a.mu：关进程要等几秒，别把 Ctrl+C 卡住。
+	mcpMu      sync.Mutex
+	mcpClients []*mcp.Client
 
 	mu        sync.Mutex
 	running   bool
@@ -97,10 +113,12 @@ func newApp(args []string) (*app, string, error) {
 		asJSON    = fs.Bool("json", false, "只输出 JSON 结果（隐含 -quiet）")
 		quiet     = fs.Bool("quiet", false, "不打印执行过程")
 		maxTurns  = fs.Int("max-turns", 30, "单次任务允许的最大轮数")
+		maxCost   = fs.Float64("max-cost", 0, "会话累计花费上限（美元），0 表示不设限")
 		cmdTO     = fs.Duration("cmd-timeout", 2*time.Minute, "单条命令默认超时")
 		resume    = fs.String("resume", "", "恢复会话：会话 ID 或 last")
 		noSession = fs.Bool("no-session", false, "不把对话写入 .go-agent/sessions")
 		logLevel  = fs.String("log-level", os.Getenv("LOG_LEVEL"), "日志级别 debug/info/warn/error")
+		mcpConfig = fs.String("mcp-config", "", "MCP 配置文件，默认 .go-agent/mcp.json（可用 GO_AGENT_MCP_CONFIG 指定）")
 		printVers = fs.Bool("version", false, "打印版本后退出")
 	)
 
@@ -167,21 +185,36 @@ func newApp(args []string) (*app, string, error) {
 	// 注册工具
 	a.registry = tools.NewRegistry()
 	state := tools.NewFileState()
+	idx := tools.NewRepoIndex()
+	a.index = idx
 	a.plan = tools.NewPlanTool(a.ui())
 	a.registry.Register(tools.NewReadFileTool(workingDir, state))
-	a.registry.Register(tools.NewSearchCodeTool(workingDir))
+	a.registry.Register(tools.NewSearchCodeTool(workingDir).WithIndex(idx))
 	a.registry.Register(tools.NewListDirectoryTool(workingDir))
-	a.registry.Register(tools.NewWriteFileTool(workingDir, a.gate, state))
-	a.registry.Register(tools.NewEditFileTool(workingDir, a.gate, state))
-	a.registry.Register(tools.NewMoveFileTool(workingDir, a.gate, state))
-	a.registry.Register(tools.NewDeleteFileTool(workingDir, a.gate, state))
+	a.registry.Register(tools.NewRepoOverviewTool(workingDir))
+	a.registry.Register(tools.NewWriteFileTool(workingDir, a.gate, state).WithIndex(idx))
+	a.registry.Register(tools.NewEditFileTool(workingDir, a.gate, state).WithIndex(idx))
+	a.registry.Register(tools.NewMoveFileTool(workingDir, a.gate, state).WithIndex(idx))
+	a.registry.Register(tools.NewDeleteFileTool(workingDir, a.gate, state).WithIndex(idx))
 	a.registry.Register(tools.NewRunCommandTool(workingDir, a.gate, *cmdTO, a.ui()))
 	a.registry.Register(a.plan)
+	a.registry.Register(tools.NewTaskTool(&subAgentRunner{app: a}, a.gate, a.ui()))
+
+	// 外部工具：配置不存在就是没装，不会因此报错
+	if err := a.connectMCPServers(mcp.ConfigPath(
+		firstNonEmpty(*mcpConfig, os.Getenv("GO_AGENT_MCP_CONFIG"), mcp.DefaultConfigPath), workingDir)); err != nil {
+		return nil, "", err
+	}
 
 	cfg := agent.DefaultConfig(workingDir, modelID)
 	cfg.MaxIterations = *maxTurns
+	cfg.MaxCostUSD = *maxCost
 	cfg.Quiet = *asJSON || *quiet
 	cfg.Writer = os.Stdout
+	// 主 agent 和子 agent 共用同一份大输出缓存（cfg 会被复制进 newSubAgent，指针跟着走）。
+	// 各建一份的话，两边在同一个目录里写同名文件，容量上限也变成各算各的。
+	cfg.Cache = agent.NewToolCache(
+		filepath.Join(workingDir, ".go-agent", "toolcache"), ".go-agent/toolcache")
 	a.cfg = cfg
 	a.provider = prov
 	a.agent = agent.New(cfg, prov, a.registry)
@@ -193,12 +226,77 @@ func newApp(args []string) (*app, string, error) {
 
 	if *resume != "" {
 		if err := a.resumeSession(*resume); err != nil {
+			a.closeMCPServers() // 已经拉起来的子进程要带走，别留给调用方
 			return nil, "", err
 		}
 	}
 
 	a.installSignalHandler()
 	return a, promptText, nil
+}
+
+// connectMCPServers 拉起配置里的 MCP 服务器，把它们的工具注册进同一个 registry。
+//
+// 单台起不来只警告：配置里通常有好几台，一台坏了不该让 CLI 用不了。
+// 但坏的那台一定要说清楚——静默跳过的话，人以为工具在，模型却看不到。
+func (a *app) connectMCPServers(path string) error {
+	servers, err := mcp.LoadConfig(path)
+	if err != nil {
+		return err
+	}
+	for _, cfg := range servers {
+		if cfg.Disabled {
+			log.Debug("MCP 服务器 %s 配置为 disabled，跳过", cfg.Name)
+			continue
+		}
+		if missing := uniqueStrings(cfg.MissingEnv); len(missing) > 0 {
+			// 空 token 起来的服务器会一路 401，现场看不出来；配置引用了没设置的变量就直接说
+			fmt.Fprintf(a.ui(), "⚠️  MCP 服务器 %s 的配置引用了未设置的环境变量：%s（已展开成空值）\n",
+				cfg.Name, strings.Join(missing, "、"))
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), cfg.Timeout)
+		client, err := mcp.StartServer(ctx, cfg)
+		cancel()
+		if err != nil {
+			fmt.Fprintf(a.ui(), "⚠️  MCP 服务器 %s 启动失败：%v\n", cfg.Name, err)
+			continue
+		}
+
+		names, skipped, err := tools.RegisterMCPServer(a.registry, client, a.gate, cfg.Timeout)
+		if err != nil {
+			client.Close()
+			fmt.Fprintf(a.ui(), "⚠️  MCP 服务器 %s 没有可用工具：%v\n", cfg.Name, err)
+			continue
+		}
+		a.mcpClients = append(a.mcpClients, client)
+
+		if len(names) > 0 {
+			fmt.Fprintf(a.ui(), "🔌 MCP %s：导入 %d 个工具（%s）\n",
+				cfg.Name, len(names), strings.Join(names, ", "))
+		} else {
+			fmt.Fprintf(a.ui(), "🔌 MCP %s：已连接，但服务器没提供工具\n", cfg.Name)
+		}
+		for _, s := range skipped {
+			fmt.Fprintf(a.ui(), "   跳过 %s\n", s)
+		}
+	}
+	return nil
+}
+
+// closeMCPServers 收摊：这些子进程是我们拉起来的，退出时全部带走。
+func (a *app) closeMCPServers() {
+	a.mcpMu.Lock()
+	clients := a.mcpClients
+	a.mcpClients = nil
+	a.mcpMu.Unlock()
+
+	for _, c := range clients {
+		if err := c.Close(); err != nil {
+			// 进程是被信号终止的，Wait 返回退出码属正常，不值得吵人
+			log.Debug("关闭 MCP 服务器 %s: %v", c.Server(), err)
+		}
+	}
 }
 
 // ui 返回过程输出的目标：JSON 模式下丢弃，避免污染 stdout。
@@ -210,10 +308,78 @@ func (a *app) ui() io.Writer {
 }
 
 // ============================================================================
+// 子智能体
+// ============================================================================
+
+// subAgentRunner 把 tools.SubAgentRunner 接到一个全新的子 agent 上。
+type subAgentRunner struct{ app *app }
+
+// RunSubAgent 在全新上下文里跑一个子任务，只回传结论。
+//
+// 子 agent 默认只读（读文件/搜索/列目录/仓库骨架）：它翻很多文件的过程
+// 留在自己的历史里，不污染主对话，也不能改动文件系统或执行命令。
+// writable 由 task 工具在派发前问过用户，这里只负责据此换一套工具面和提示词。
+func (r *subAgentRunner) RunSubAgent(ctx context.Context, task string, writable bool) (string, error) {
+	child := r.app.newSubAgent(writable)
+	res, err := child.Run(ctx, task)
+
+	// 子任务烧掉的 token 要计入总花费，否则 /cost 会低估。
+	// 即便子 agent 中途报错，它已经发生的调用也真实花了钱，所以无条件累加。
+	r.app.agent.AddUsage(child.Usage())
+
+	if err != nil {
+		return "", err
+	}
+	return res.Reply, nil
+}
+
+// newSubAgent 造一个独立历史的子 agent。
+//
+// 两副面孔：只读面只有读文件/搜索/列目录/仓库骨架；可写面在此之上加
+// write_file 与 edit_file——**只加这两个**。执行命令的破坏半径无法用 diff 表达，
+// 删除和移动会让"改哪个文件"变成"哪个文件没了"，而 task 会让子 agent 再派孙 agent，
+// 审批就散落到没人看的那一层去了。
+func (a *app) newSubAgent(writable bool) *agent.Agent {
+	cfg := a.cfg
+	cfg.Quiet = true       // 子过程不刷屏，主 agent 只拿最终结论
+	cfg.MaxIterations = 12 // 子任务范围更小，更快收敛
+	if writable {
+		cfg.SystemPrompt = agent.SubAgentWritePrompt(cfg.WorkingDir)
+	} else {
+		cfg.SystemPrompt = agent.SubAgentPrompt(cfg.WorkingDir)
+	}
+	return agent.New(cfg, a.provider, a.subRegistry(writable))
+}
+
+// subRegistry 装配子 agent 的工具面。
+//
+// 单独拆出来是为了让"这道门到底共用不共用"可测：可写面拿的是 a.gate 这一个实例，
+// 父子共用一道门意味着子 agent 每次写入都要单独问一次，而不是继承一次"批准派发"。
+// FileState 则**各自一份**——共享的话，父级读过的文件会替子级开门，
+// 第 3 条的"先读后改"就只剩父级那一次读了。
+// RepoIndex 反过来必须共用：它只缓存元信息，各拿一份等于白白重新判定每个文件。
+func (a *app) subRegistry(writable bool) *tools.Registry {
+	reg := tools.NewRegistry()
+	state := tools.NewFileState()
+	reg.Register(tools.NewReadFileTool(a.cfg.WorkingDir, state))
+	reg.Register(tools.NewSearchCodeTool(a.cfg.WorkingDir).WithIndex(a.index))
+	reg.Register(tools.NewListDirectoryTool(a.cfg.WorkingDir))
+	reg.Register(tools.NewRepoOverviewTool(a.cfg.WorkingDir))
+
+	if writable {
+		reg.Register(tools.NewWriteFileTool(a.cfg.WorkingDir, a.gate, state).WithIndex(a.index))
+		reg.Register(tools.NewEditFileTool(a.cfg.WorkingDir, a.gate, state).WithIndex(a.index))
+	}
+	return reg
+}
+
+// ============================================================================
 // 执行一条任务
 // ============================================================================
 
 func (a *app) runOnce(prompt string) int {
+	defer a.closeMCPServers()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	a.setRunning(cancel)
 	defer a.setRunning(nil)
@@ -273,6 +439,8 @@ func report(res *agent.Result) string {
 
 // repl 交互式循环。
 func (a *app) repl() int {
+	defer a.closeMCPServers()
+
 	a.printWelcome()
 
 	for {
@@ -379,6 +547,8 @@ func (a *app) installSignalHandler() {
 				continue
 			}
 			fmt.Fprintf(a.out, "\n\n👋 收到 %v，退出。\n", sig)
+			// 立即退出也要收摊，否则我们拉起的 MCP 子进程全变成孤儿
+			a.closeMCPServers()
 			os.Exit(130)
 		}
 	}()
@@ -397,8 +567,14 @@ func (a *app) setRunning(cancel context.CancelFunc) {
 // ============================================================================
 
 // confirm 向用户确认一次有副作用的操作。
+// detail 可能是多行（写入类操作带着 diff）：每一行都缩进对齐，
+// 让改动内容和"允许执行？"这个问题在视觉上分开。
 func (a *app) confirm(title, detail string) bool {
-	fmt.Fprintf(a.out, "\n  🔶 %s\n     %s\n  允许执行？[y/N] ", title, detail)
+	fmt.Fprintf(a.out, "\n  🔶 %s\n", title)
+	for _, line := range strings.Split(strings.TrimRight(detail, "\n"), "\n") {
+		fmt.Fprintf(a.out, "     %s\n", line)
+	}
+	fmt.Fprint(a.out, "  允许执行？[y/N] ")
 	line, err := a.in.ReadString('\n')
 	if err != nil {
 		return false
@@ -482,8 +658,17 @@ func (a *app) handleCommand(input string) (handled, quit bool) {
 		return true, false
 	case "/cost":
 		u := a.agent.Usage()
-		fmt.Printf("📊 累计 token：输入 %d / 输出 %d，约 $%.4f（按内置价目表估算）\n\n",
-			u.InputTokens, u.OutputTokens, agent.EstimateCost(a.cfg.Model, u))
+		cost := agent.EstimateCost(a.cfg.Model, u)
+		fmt.Printf("📊 累计 token：输入 %d / 输出 %d，约 $%.4f（按内置价目表估算）\n",
+			u.InputTokens, u.OutputTokens, cost)
+		if u.CacheReadInputTokens > 0 || u.CacheCreationInputTokens > 0 {
+			fmt.Printf("   缓存：命中读 %d、写入 %d（这两段按 0.1x / 1.25x 计价，已计入上面的金额）\n",
+				u.CacheReadInputTokens, u.CacheCreationInputTokens)
+		}
+		if a.cfg.MaxCostUSD > 0 {
+			fmt.Printf("   本次运行上限 $%.2f，已用 %.0f%%\n",
+				a.cfg.MaxCostUSD, cost/a.cfg.MaxCostUSD*100)
+		}
 		return true, false
 	case "/tools":
 		fmt.Printf("🔧 已注册工具: %s\n\n", strings.Join(a.registry.Names(), ", "))
@@ -647,7 +832,10 @@ func usage(fs *flag.FlagSet) func() {
 选项：`)
 		fs.PrintDefaults()
 		fmt.Println(`
-密钥：DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY(+LLM_BASE_URL)`)
+密钥：DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY(+LLM_BASE_URL)
+
+外部工具：默认读 .go-agent/mcp.json（-mcp-config 可换路径）。
+里面的工具一样要过审批门：改动类的远端调用会逐个向你确认，返回内容按外部数据处理。`)
 	}
 }
 
@@ -660,6 +848,24 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// uniqueStrings 去掉重复项，保持首次出现的顺序。
+func uniqueStrings(vals []string) []string {
+	var out []string
+	for _, v := range vals {
+		seen := false
+		for _, o := range out {
+			if o == v {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func firstNonEmpty(vals ...string) string {

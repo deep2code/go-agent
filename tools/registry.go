@@ -37,6 +37,31 @@ type Tool interface {
 // Registry — 工具注册表
 // ============================================================================
 
+// ParallelSafeTool 是可选接口：实现它且返回 true 的工具，允许和其他同类工具
+// 在同一轮里并行执行。
+//
+// 缺省是串行——"没声明"不等于"并发安全"。判定标准只有两条，都要同时满足：
+//  1. 不会改动文件系统（Mutating() 为 false），否则并行的两次改动会互相踩 diff 基线；
+//  2. 自己不占终端、不派子循环、不产生额外花费。
+//
+// 典型反例是 task：它是只读的，但要跑完一整轮子 agent，并行等于同时开几个
+// 无人看管的模型调用。
+type ParallelSafeTool interface {
+	Tool
+
+	// ParallelSafe 报告该工具可以安全地并发执行。
+	ParallelSafe() bool
+}
+
+// Parallelizable 判断一个工具能否进并发组。没实现 ParallelSafeTool 的一律串行。
+func Parallelizable(t Tool) bool {
+	ps, ok := t.(ParallelSafeTool)
+	if !ok {
+		return false
+	}
+	return !t.Mutating() && ps.ParallelSafe()
+}
+
 // Registry 管理所有可用工具的集合。
 type Registry struct {
 	tools map[string]Tool // name -> Tool
@@ -68,6 +93,15 @@ func (r *Registry) Register(t Tool) {
 func (r *Registry) Get(name string) (Tool, bool) {
 	t, ok := r.tools[name]
 	return t, ok
+}
+
+// Has 报告该名字是否已被占用。
+//
+// Register 重名会 panic（那是给本地代码的开发期门）；注册外部来源的工具前先用它查一遍，
+// 外部工具名由别人决定，撞名是配置问题，不该把进程弄死。
+func (r *Registry) Has(name string) bool {
+	_, ok := r.tools[name]
+	return ok
 }
 
 // Names 返回按字母序排列的工具名。

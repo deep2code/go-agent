@@ -603,6 +603,54 @@ func msgTextOf(m llm.Message) string {
 	return strings.Join(parts, " ")
 }
 
+// 折叠到第二级时，被丢的往返要先摘要再丢弃，摘要要真的写回 history。
+// 直接驱动 a.compact 而不是跑整个 Run：摘要调用和对话调用共用同一个
+// scripted 队列，跑整循环会让第几步是摘要变得不可控。
+func TestCompactSummarizesIntoHistory(t *testing.T) {
+	long := strings.Repeat("很长的工具输出行\n", 400)
+
+	// 一步：provider 被摘要调用时返回这段文本
+	p := &scriptedProvider{steps: []scriptedStep{
+		stopReply("入口在 main.go，已读完 a/b/c 三个文件。", 0, 0),
+	}}
+	a, _ := newAgent(t, p, registryWith(&fakeTool{name: "reader", result: long}), func(c *Config) {
+		c.ContextWindow = 5000
+		c.MaxTokens = 2000
+	})
+
+	history := []llm.Message{
+		{Role: llm.RoleUser, Content: []llm.ContentBlock{text("反复读大文件")}},
+	}
+	for i := 0; i < 5; i++ {
+		id := fmt.Sprintf("t%d", i)
+		history = append(history,
+			llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{toolUse(id, "reader")}},
+			llm.Message{Role: llm.RoleUser, Content: []llm.ContentBlock{toolResult(id, long)}},
+		)
+	}
+	a.history = history
+
+	if freed := a.compact(context.Background(), 3000); freed <= 0 {
+		t.Fatal("compact 没有省下 token")
+	}
+
+	if len(p.requests) != 1 || len(p.requests[0].Tools) != 0 {
+		t.Fatalf("应恰好发起一次摘要请求（不带工具），实际 %d 次", len(p.requests))
+	}
+	if !strings.Contains(p.requests[0].System, "压缩") {
+		t.Error("摘要请求没带压缩器的系统提示词")
+	}
+
+	first := msgTextOf(a.history[0])
+	if !strings.Contains(first, "反复读大文件") {
+		t.Errorf("第一条任务丢了: %q", first)
+	}
+	if !strings.Contains(first, "早前对话摘要") || !strings.Contains(first, "入口在 main.go") {
+		t.Errorf("摘要没写回 history 第一条:\n%s", first)
+	}
+	assertValid(t, a.history)
+}
+
 // 过程输出走 config.Writer：非交互 JSON 模式靠这个把噪声挡在 stdout 之外。
 func TestProcessOutputGoesToWriter(t *testing.T) {
 	var buf bytes.Buffer

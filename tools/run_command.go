@@ -176,7 +176,8 @@ func (t *RunCommandTool) Execute(ctx context.Context, input map[string]any) (str
 
 	// 命令本身失败不作为工具错误返回：退出码和输出对模型就是有效信息，
 	// 让它自己读日志决定下一步。
-	return sb.String(), nil
+	// 输出同样是外部数据——被攻击的仓库里的构建脚本可以打印一段伪装成指令的文字。
+	return GuardExternalContent(sb.String(), "", nil), nil
 }
 
 // lineEcho 把命令输出按行实时回显到终端。

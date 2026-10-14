@@ -54,6 +54,38 @@ func TestAnthropicSSETextStream(t *testing.T) {
 	}
 }
 
+// 缓存段只在 message_start 出现，逐字段拷贝会把它们丢掉：
+// 剩下的 InputTokens 是"未命中缓存的那一小段"，拿它当真实输入去校准预算会一路偏小。
+func TestAnthropicSSECacheUsage(t *testing.T) {
+	stream := sse(
+		[2]string{"message_start", `{"type":"message_start","message":{"id":"m","model":"claude-x"},"usage":{"input_tokens":20,"cache_creation_input_tokens":1800,"cache_read_input_tokens":12000,"output_tokens":2}}`},
+		[2]string{"content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`},
+		[2]string{"content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"好"}}`},
+		[2]string{"content_block_stop", `{"type":"content_block_stop","index":0}`},
+		[2]string{"message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":30}}`},
+		[2]string{"message_stop", `{"type":"message_stop"}`},
+	)
+
+	resp, err := parseAnthropic(t, stream, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := resp.Usage
+	if u.InputTokens != 20 || u.CacheCreationInputTokens != 1800 || u.CacheReadInputTokens != 12000 {
+		t.Fatalf("缓存用量没接住: %+v", u)
+	}
+	if u.PromptTokens() != 13820 {
+		t.Errorf("PromptTokens = %d，期望 13820", u.PromptTokens())
+	}
+	// message_delta 只带 output_tokens，不该把缓存段冲成 0。
+	if u.OutputTokens != 30 || u.CacheReadInputTokens != 12000 {
+		t.Errorf("收尾用量 = %+v", u)
+	}
+	if u.Total() != 13850 {
+		t.Errorf("Total = %d，期望 13850", u.Total())
+	}
+}
+
 func TestAnthropicSSEThinkingThenTool(t *testing.T) {
 	stream := sse(
 		[2]string{"message_start", `{"type":"message_start","message":{"id":"msg_2","model":"claude-x"},"usage":{"input_tokens":8}}`},

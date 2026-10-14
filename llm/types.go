@@ -6,7 +6,10 @@
 // 参考文档: https://docs.anthropic.com/en/api/messages
 package llm
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // ============================================================================
 // 角色与消息
@@ -74,7 +77,43 @@ type ToolDef struct {
 	Name        string      `json:"name"`
 	Description string      `json:"description"`
 	InputSchema InputSchema `json:"input_schema"`
+
+	// RawSchema 非空时替代 InputSchema 原样下发。
+	// 外部来源（如 MCP 服务器）的 JSON Schema 里有 enum、items、$ref 这些
+	// InputSchema 表达不了的字段，折进去会把参数说明丢给模型看没了。
+	RawSchema json.RawMessage `json:"-"`
+
+	// CacheControl 只在请求前缀的最后一个工具上设置，标记"到这里为止可缓存"。
+	// 由 Provider 在发送前填，工具自身不需要关心。
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
+
+// MarshalJSON 让 RawSchema 生效：它不参与结构体本身的字段序列化，
+// 只有这里能把它替换进 input_schema。
+func (t ToolDef) MarshalJSON() ([]byte, error) {
+	if len(t.RawSchema) == 0 {
+		type plainToolDef ToolDef
+		return json.Marshal(plainToolDef(t))
+	}
+	if !json.Valid(t.RawSchema) {
+		return nil, fmt.Errorf("工具 %s 的 input_schema 不是合法 JSON", t.Name)
+	}
+	return json.Marshal(struct {
+		Name         string          `json:"name"`
+		Description  string          `json:"description"`
+		InputSchema  json.RawMessage `json:"input_schema"`
+		CacheControl *CacheControl   `json:"cache_control,omitempty"`
+	}{t.Name, t.Description, t.RawSchema, t.CacheControl})
+}
+
+// CacheControl 是 Anthropic prompt caching 的断点标记。
+// Type 目前只有 "ephemeral"（5 分钟 TTL，命中后自动续期）。
+type CacheControl struct {
+	Type string `json:"type"`
+}
+
+// ephemeralCache 是唯一的缓存类型，构造函数避免各处写裸字符串。
+func ephemeralCache() *CacheControl { return &CacheControl{Type: "ephemeral"} }
 
 // InputSchema 工具的 JSON Schema，固定 type 为 "object"。
 type InputSchema struct {
@@ -95,12 +134,19 @@ type Property struct {
 
 // MessageRequest 一次 Messages API 调用的完整请求体。
 type MessageRequest struct {
-	Model     string    `json:"model"`
-	MaxTokens int       `json:"max_tokens"`
-	System    string    `json:"system,omitempty"` // 系统提示词（或使用 system 数组）
-	Messages  []Message `json:"messages"`
-	Tools     []ToolDef `json:"tools,omitempty"`
-	Stream    bool      `json:"stream,omitempty"`
+	Model     string        `json:"model"`
+	MaxTokens int           `json:"max_tokens"`
+	System    []SystemBlock `json:"system,omitempty"` // 块数组：字符串形式带不了 cache_control
+	Messages  []Message     `json:"messages"`
+	Tools     []ToolDef     `json:"tools,omitempty"`
+	Stream    bool          `json:"stream,omitempty"`
+}
+
+// SystemBlock 系统提示词的一个内容块。
+type SystemBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *CacheControl `json:"cache_control,omitempty"`
 }
 
 // ============================================================================
@@ -117,13 +163,24 @@ type MessageResponse struct {
 }
 
 // Usage token 用量统计。
+//
+// Anthropic 开启 prompt caching 后，InputTokens 只包含未命中缓存的那部分前缀，
+// 缓存读/写分别记账——算总输入和算钱都得把三段加起来，不能只看 InputTokens。
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens,omitempty"`
 }
 
 // Total 返回本次用量的总 token 数。
-func (u Usage) Total() int { return u.InputTokens + u.OutputTokens }
+func (u Usage) Total() int { return u.PromptTokens() + u.OutputTokens }
+
+// PromptTokens 返回本次请求发给模型的输入 token 总数（含缓存段）。
+// 这是服务端的权威计数，本地的启发式估算要跟它对齐。
+func (u Usage) PromptTokens() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
 
 // ============================================================================
 // 错误响应

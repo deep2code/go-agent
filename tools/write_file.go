@@ -19,11 +19,19 @@ type WriteFileTool struct {
 	workingDir string
 	gate       *Gate
 	state      *FileState
+	index      *RepoIndex
 }
 
 // NewWriteFileTool 创建 write_file 工具。
 func NewWriteFileTool(workingDir string, gate *Gate, state *FileState) *WriteFileTool {
 	return &WriteFileTool{workingDir: workingDir, gate: gate, state: state}
+}
+
+// WithIndex 挂上会话级元信息缓存：写入后让该路径的结论作废，
+// 否则下一趟搜索会拿着旧大小/旧的二进制判定说假话。
+func (t *WriteFileTool) WithIndex(idx *RepoIndex) *WriteFileTool {
+	t.index = idx
+	return t
 }
 
 // Name 返回工具名。
@@ -69,6 +77,10 @@ func (t *WriteFileTool) Execute(ctx context.Context, input map[string]any) (stri
 	if err != nil {
 		return "", err
 	}
+	// 凭据文件由用户在终端管理：写入会覆盖真凭据，diff 又会把原内容摊进对话
+	if SensitivePath(filePath) {
+		return "", ErrSensitivePath(filePath)
+	}
 
 	existed, err := t.state.CheckWritable(filePath, absPath)
 	if err != nil {
@@ -79,7 +91,13 @@ func (t *WriteFileTool) Execute(ctx context.Context, input map[string]any) (stri
 			maxWriteBytes, len(content))
 	}
 
-	if err := t.gate.Approve(t.Name(), DescribeWrite(filePath, len(content), existed)); err != nil {
+	// 疑似密钥不许落盘：auto / readonly 下没人看确认框，直接拒绝
+	warning, err := CheckSecretWrite(t.gate.Mode, content)
+	if err != nil {
+		return "", err
+	}
+
+	if err := t.gate.Approve(t.Name(), t.approvalDetail(filePath, absPath, content, existed, warning)); err != nil {
 		return "", err
 	}
 
@@ -97,7 +115,8 @@ func (t *WriteFileTool) Execute(ctx context.Context, input map[string]any) (stri
 	if err := os.WriteFile(absPath, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("写入文件失败: %w", err)
 	}
-	t.state.Mark(absPath)
+	t.index.Forget(absPath)
+	t.state.MarkRead(filePath, absPath)
 
 	if existed {
 		return fmt.Sprintf("✅ 已覆盖 %s（%d 字节，上一版备份在 %s）",
@@ -108,6 +127,32 @@ func (t *WriteFileTool) Execute(ctx context.Context, input map[string]any) (stri
 
 // maxWriteBytes 单次写入的字节上限，防止一次吐出超大文件把上下文占满。
 const maxWriteBytes = 512 * 1024
+
+// approvalDetail 组装确认框文本。
+//
+// 只有真的会问人才展开 diff 和依据文件：auto / readonly 模式下确认不会发生，
+// 没必要为一次注定被丢弃的对比去读整个文件。
+func (t *WriteFileTool) approvalDetail(relPath, absPath, content string, existed bool, secretWarning string) string {
+	detail := DescribeWrite(relPath, len(content), existed)
+	if t.gate.Mode != ModeAsk {
+		return detail
+	}
+	var old string
+	if existed {
+		data, err := os.ReadFile(absPath)
+		if err != nil {
+			return detail + "\n（读取磁盘上的原文件失败，无法生成 diff）"
+		}
+		old = string(data)
+	}
+	if secretWarning != "" {
+		detail += "\n" + secretWarning
+	}
+	if sources := SourcesLine(t.state); sources != "" {
+		detail += "\n" + sources
+	}
+	return detail + "\n" + UnifiedDiff(relPath, old, content)
+}
 
 // backupPath 返回备份文件路径。
 func backupPath(absPath string) string {

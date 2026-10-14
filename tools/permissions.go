@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"regexp"
+	"sync"
 )
 
 // ============================================================================
@@ -34,6 +35,11 @@ type Gate struct {
 
 	// Out 用于把拒绝原因回显给用户，可为 nil。
 	Out io.Writer
+
+	// askMu 把"提问—等回答"串起来。
+	// 主 agent 和可写子 agent 共用一道门，两边都可能在问话；
+	// 交错打印会让用户看到半句问题就输入了 y，那等于把确认变成抽签。
+	askMu sync.Mutex
 }
 
 // NewGate 创建审批门。
@@ -62,6 +68,10 @@ func (g *Gate) Approve(toolName, detail string) error {
 			g.note("🚫 %s 需要确认，但没有可用的确认渠道", toolName)
 			return fmt.Errorf("%w: 无法向用户确认 %s", ErrDenied, toolName)
 		}
+		// 一次只问一个问题：子 agent 的写入和主 agent 的写入可能同时找上门，
+		// 把整段"打印详情—读输入"锁住，用户看到的才是一道完整的问句。
+		g.askMu.Lock()
+		defer g.askMu.Unlock()
 		if g.Ask(toolName, detail) {
 			return nil
 		}

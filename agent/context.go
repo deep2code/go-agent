@@ -1,11 +1,13 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"unicode"
 
 	"go-agent/llm"
+	"go-agent/log"
 )
 
 // ============================================================================
@@ -273,14 +275,71 @@ func keepMatchedResults(blocks []llm.ContentBlock, want []string) []llm.ContentB
 // keepRecentResults 折叠时保留原样的最近工具结果条数。
 const keepRecentResults = 3
 
+// Pointerize 是 L2：把历史里**较早的**大段工具输出换成指针，返回省下的字节数。
+//
+// 触发点在每次构建上下文时、估算之前——它比折叠温和得多：
+// 只替换 tool_result 的正文，不动 tool_use、不动 ToolUseID、不动消息顺序，
+// 所以配对结构和角色交替都不受影响，RepairHistory 不需要再介入。
+//
+// 为什么要单独有这一级：L1 只拦得住"单次就超限"的输出，
+// 而真正压垮预算的常常是十几条各自不算大、加起来很可观的 read_file 结果。
+// 它们按 L1 的门槛原样进了历史，之后每一轮都被重复发送。
+// 这里用更低的门槛（l2CacheFrom）和更短的预览（l2HeadBytes/l2TailBytes）把早期的换成
+// "头 + 指针 + 尾"，模型要看全文时按指针回读，一轮就只为需要它的那次调用付费。
+//
+// 最近 l2KeepRecent 条保持原样：那几轮通常正是模型下一步动作的依据，
+// 换掉等于逼它再调一次同样的工具，省下的 token 又花回去了。
+func (a *Agent) Pointerize(messages []llm.Message) int {
+	if a.cache == nil {
+		return 0
+	}
+	total := 0
+	seen := 0
+	// 从后往前数，最近几条不动
+	for i := len(messages) - 1; i >= 0; i-- {
+		for j, b := range messages[i].Content {
+			if b.Type != "tool_result" {
+				continue
+			}
+			seen++
+			if seen <= l2KeepRecent {
+				continue
+			}
+			text := toolResultText(b)
+			if len(text) < l2CacheFrom {
+				continue
+			}
+			trimmed := a.cache.Pointer(b.ToolUseID, text)
+			if len(trimmed) >= len(text) {
+				continue
+			}
+			total += len(text) - len(trimmed)
+			messages[i].Content[j].Content = trimmed
+		}
+	}
+	return total
+}
+
+// Summarizer 把即将被丢弃的一段历史压缩成可读摘要。
+// 为 nil 时第二级折叠退化成"整轮丢弃"，不留摘要。
+type Summarizer func(ctx context.Context, messages []llm.Message) (string, error)
+
 // CompactHistory 在历史超出预算时压缩它，返回压缩后的历史和省下的 token 数。
 //
 // 两步走，先温和后激烈：
 //  1. 把较早的工具输出换成一行占位说明——模型通常只需要知道"那一步查过了"，
 //     不需要重读整份文件内容；对话结构完全不变。
-//  2. 还不够就整轮丢弃最早的往返（assistant + 其工具结果一起丢），
-//     但永远保留第一条用户任务和最近 keepRecentRounds 轮。
-func CompactHistory(messages []llm.Message, budget int) (compacted []llm.Message, freed int) {
+//     已经外置过的正文（第 14 条）不套占位说明，只砍掉头尾预览、留下指针那一行：
+//     一句"已折叠"会把回读路径一起丢掉，那一轮就再也取不回原文了。
+//  2. 还不够就折叠最早的往返（assistant + 其工具结果一起）。给了 summarize
+//     就把这些往返压成一段摘要插在任务后面，否则直接丢弃。
+//     无论哪种，都永远保留第一条用户任务和最近 keepRecentRounds 轮。
+//
+// summarize 会发起一次额外的模型调用，只在第一段确实要丢时才触发，不做无谓调用。
+func CompactHistory(ctx context.Context, messages []llm.Message, budget int, summarize Summarizer) (compacted []llm.Message, freed int) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	before := EstimateTokens(messages)
 	if before <= budget {
 		return messages, 0
@@ -306,6 +365,12 @@ func CompactHistory(messages []llm.Message, budget int) (compacted []llm.Message
 			if size < 200 {
 				continue
 			}
+			if line, ok := foldToPointer(toolResultText(b)); ok {
+				// 已经治理过的：只剩指针那一行。回读路径留着，占地方的头尾预览去掉——
+				// 换成一句"已折叠"会把路径一起丢掉，那一轮就再也取不回原文了。
+				out[i].Content[j].Content = line
+				continue
+			}
 			out[i].Content[j].Content = fmt.Sprintf("（较早的工具输出已折叠，原本 %d 字节）", size)
 		}
 	}
@@ -315,9 +380,26 @@ func CompactHistory(messages []llm.Message, budget int) (compacted []llm.Message
 	}
 
 	// 第二步：整轮丢弃最早的往返
+	var dropped []llm.Message
 	for len(out) > keepRecentRounds+2 && EstimateTokens(out) > budget {
 		n := dropRound(out, 1) // 索引 0 是用户的原始任务，保留
+		dropped = append(dropped, out[1:1+n]...)
 		out = append(out[:1], out[1+n:]...)
+	}
+
+	// 丢掉的往返里有结论，压成一段摘要贴在任务后面；拿不到摘要就接受丢弃。
+	// 追加进第一条消息而不是另起一条：索引 0 已经是 user，再起一条 user 就破坏了交替。
+	if len(dropped) > 0 && summarize != nil {
+		note, err := summarize(ctx, dropped)
+		switch {
+		case err != nil:
+			log.Warn("历史摘要失败，本轮按丢弃处理: %v", err)
+		case strings.TrimSpace(note) != "":
+			out[0].Content = append(out[0].Content, llm.ContentBlock{
+				Type: "text",
+				Text: "📝 早前对话摘要（为守住上下文预算被压缩，非原文）：\n" + strings.TrimSpace(note),
+			})
+		}
 	}
 
 	return out, before - EstimateTokens(out)

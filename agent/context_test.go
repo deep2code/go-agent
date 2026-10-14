@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -259,8 +260,8 @@ func TestCompactHistoryFoldsOldResults(t *testing.T) {
 	messages = append(messages, llm.Message{Role: llm.RoleAssistant, Content: []llm.ContentBlock{text("结论是……")}})
 
 	before := EstimateTokens(messages)
-	// 预算压到 1/5：第一轮折叠不够，必须进入整轮丢弃
-	compact, freed := CompactHistory(messages, before/5)
+	// 预算压到 1/5：第一轮折叠不够，必须进入整轮丢弃（summarize 为 nil，退回丢弃）
+	compact, freed := CompactHistory(context.Background(), messages, before/5, nil)
 	if freed <= 0 {
 		t.Fatal("超出预算却没有省下任何 token")
 	}
@@ -282,7 +283,7 @@ func TestCompactHistoryFoldsOldResults(t *testing.T) {
 	assertValid(t, compact)
 
 	// 未超预算时不该动内容
-	kept, freed := CompactHistory(messages, before*2)
+	kept, freed := CompactHistory(context.Background(), messages, before*2, nil)
 	if freed != 0 {
 		t.Errorf("预算充足却进行了折叠: freed=%d", freed)
 	}

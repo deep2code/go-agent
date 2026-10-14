@@ -70,6 +70,9 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	if err != nil {
 		return "", err
 	}
+	if SensitivePath(filePath) {
+		return "", ErrSensitivePath(filePath)
+	}
 
 	// 读取文件
 	data, err := os.ReadFile(absPath)
@@ -81,7 +84,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 	}
 
 	lines := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
-	t.state.Mark(absPath)
+	t.state.MarkRead(filePath, absPath)
 
 	// 起始行（1-based）
 	start := 0
@@ -120,7 +123,7 @@ func (t *ReadFileTool) Execute(ctx context.Context, input map[string]any) (strin
 			len(lines)-end, end+1))
 	}
 
-	return sb.String(), nil
+	return GuardExternalContent(sb.String(), filePath, t.state), nil
 }
 
 // defaultMaxLines 单次读取的默认行数上限。
@@ -141,3 +144,6 @@ func inputNumber(input map[string]any, key string) (int, bool) {
 		return 0, false
 	}
 }
+
+// ParallelSafe 报告该工具可以并发执行：只读、不占终端、不派子循环。
+func (t *ReadFileTool) ParallelSafe() bool { return true }
